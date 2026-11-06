@@ -143,6 +143,7 @@ export interface StarObj extends Common {
 /** Planet or moon. */
 export interface BodyObj extends Common {
   kind: 'body';
+  lightId?: string;
   spin: Vec3;
   /** Rotation angle about the spin axis, radians. */
   rot: number;
