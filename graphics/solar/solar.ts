@@ -46,7 +46,7 @@ import {
   type Scene,
   type SceneObject,
   type StarObj,
-  type StarTile,
+  type SceneLight,
 } from '../renderer';
 
 type V3 = [number, number, number];
@@ -277,26 +277,6 @@ function makeRingTexture(gl: WebGL2RenderingContext, innerKm: number, outerKm: n
   return tex;
 }
 
-/** Placeholder star field: [x, y, z, lum, temp] per star, metres from the Sun, 10-300 pc away. */
-function makeStars(count: number): StarTile {
-  let s = 0x9e3779b9;
-  const rnd = (): number => {
-    s = (s + 0x6d2b79f5) | 0;
-    let t = Math.imul(s ^ (s >>> 15), 1 | s);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-  const data = new Float32Array(count * 5);
-  for (let i = 0; i < count; i++) {
-    const z = rnd() * 2 - 1;
-    const ph = rnd() * 2 * Math.PI;
-    const rr = Math.sqrt(1 - z * z);
-    const d = 3.086e17 * Math.pow(10, rnd() * 1.5);
-    data.set([rr * Math.cos(ph) * d, z * d, rr * Math.sin(ph) * d, Math.pow(10, -1.5 + rnd() * 4.5), 3000 + 17000 * rnd() * rnd()], i * 5);
-  }
-  return { origin: makePos(Tier.Planet, [0, 0, 0], [0, 0, 0]), data, count };
-}
-
 async function tryLoad(r: Renderer, url: string, srgb: boolean, clamp = false): Promise<WebGLTexture | null> {
   try {
     return await r.loadTexture(url, { srgb, clamp });
@@ -309,50 +289,6 @@ async function tryLoad(r: Renderer, url: string, srgb: boolean, clamp = false): 
 export function startSolar(canvas: HTMLCanvasElement): () => void {
   const renderer = new Renderer(canvas, { dynamicResolution: true, renderScale: 1, motionBlur: 0.5, temporalUpscale: true, lensFlare: 1 });
   
-  let skyTexture: WebGLTexture | null = null;
-  let stopped = false;
-
-  // ---- Milky Way background
-  void (async () => {
-    const maxTextureSize = renderer.gl.getParameter(
-      renderer.gl.MAX_TEXTURE_SIZE
-    ) as number;
-
-    const candidates = maxTextureSize >= 16384
-      ? [
-          'textures/milkyway-16k.jpg',
-          'textures/milkyway-8k.jpg'
-        ]
-      : maxTextureSize >= 8192
-        ? ['textures/milkyway-8k.jpg']
-        : [];
-
-    for (const path of candidates) {
-      const texture = await tryLoad(renderer, path, true);
-
-      if (!texture) continue;
-
-      if (stopped) {
-        renderer.gl.deleteTexture(texture);
-        return;
-      }
-
-      skyTexture = texture;
-
-      renderer.setSky({
-        map: texture,
-        mapScale: 0.0000008
-      });
-
-      console.info(`[Universe Engine] Loaded sky map: ${path}`);
-      return;
-    }
-
-    console.warn(
-      '[Universe Engine] No compatible Milky Way map found.'
-    );
-  })();
-
   const startMs = Date.now();
 
   // ---- scene objects, created once; positions and rotations are updated every frame
@@ -365,7 +301,7 @@ export function startSolar(canvas: HTMLCanvasElement): () => void {
   const objects: SceneObject[] = [sunObj];
   for (const d of DEFS) {
     if (d.name === 'sun') continue;
-    const b: BodyObj = { kind: 'body', pos: sunObj.pos, radius: d.radius, spin: poleOf(d.ra, d.dec), rot: 0, tint: d.tint, lum: 0 };
+    const b: BodyObj = { kind: 'body', lightId: 'solar:sun', pos: sunObj.pos, radius: d.radius, spin: poleOf(d.ra, d.dec), rot: 0, tint: d.tint, lum: 0 };
     if (d.atm) b.atmosphere = d.atm;
     if (LIVE.has(d.name)) b.flow = 1;
     if (d.name === 'mars') b.storm = 1; // procedural dust storms
@@ -379,14 +315,24 @@ export function startSolar(canvas: HTMLCanvasElement): () => void {
   const satDef = DEFS.find((d) => d.name === 'saturn');
   const saturn = bodyObjs.get('saturn') as BodyObj;
   const ring: RingObj = {
-    kind: 'ring', pos: sunObj.pos, radius: satDef?.radius ?? 5.8232e7, normal: saturn.spin,
+    kind: 'ring', lightId: 'solar:sun', pos: sunObj.pos, radius: satDef?.radius ?? 5.8232e7, normal: saturn.spin,
     inner: 74658e3 / (satDef?.radius ?? 5.8232e7), outer: 136775e3 / (satDef?.radius ?? 5.8232e7),
     tex: makeRingTexture(renderer.gl, 74658, 136775),
   };
   objects.push(ring);
-  const scene: Scene = { time: 0, sun: { pos: sunObj.pos, lum: 1, temp: 5772, radius: 6.957e8 }, objects };
+  const solarLight: SceneLight = {
+    id: 'solar:sun',
+    pos: sunObj.pos,
+    lum: 1,
+    temp: 5772,
+    radius: 6.957e8,
+  };
 
-  renderer.setStarTile('placeholder', makeStars(8000));
+  const scene: Scene = {
+    time: 0,
+    lights: [solarLight],
+    objects,
+  };
 
   // Saturn's ring: the Cassini-based strip in ./textures/solar/hi/ (about 16 km/texel) replaces the procedural one when it loads.
   void (async () => {
@@ -702,7 +648,7 @@ export function startSolar(canvas: HTMLCanvasElement): () => void {
       if (o) o.pos = at(helio.get(def.name) ?? [0, 0, 0]);
     }
     ring.pos = saturn.pos;
-    scene.sun = { pos: sunObj.pos, lum: 1, temp: 5772, radius: 6.957e8 };
+    solarLight.pos = sunObj.pos;
     scene.time = simSeconds;
     const cam: Camera = { pos: makePos(Tier.Planet, [0, 0, 0], camOff), right, up, forward: fwd, fovY: (60 * Math.PI) / 180 };
     renderer.render(scene, cam, dt);
@@ -710,11 +656,6 @@ export function startSolar(canvas: HTMLCanvasElement): () => void {
   raf = requestAnimationFrame(frame);
 
   return (): void => {
-    stopped = true;
-
-if (skyTexture) {
-  renderer.gl.deleteTexture(skyTexture);
-}
     cancelAnimationFrame(raf);
     window.removeEventListener('keydown', onKeyDown);
     window.removeEventListener('keyup', onKeyUp);
