@@ -177,6 +177,7 @@ export interface BodyObj extends Common {
 }
 export interface RingObj extends Common {
   kind: 'ring';
+  lightId?: string;
   normal: Vec3;
   /** Inner and outer radius in parent-planet radii. */
   inner: number;
@@ -948,13 +949,36 @@ export class Renderer {
     this.bindTex(8, this.copy.tex);
   }
 
-  private sunUniforms(p: Prog, pos: WorldPos, sun: Scene['sun']): void {
-    if (!sun) {
-      p.f('uSun', 0, 1, 0, 0);
-      p.f('uSunT', 5772);
-      p.f('uSunAng', 0.0046);
-      return;
-    }
+private lightUniforms(
+  p: Prog,
+  pos: WorldPos,
+  lights: SceneLight[],
+  lightId?: string
+): void {
+  const light = lightId === undefined
+    ? lights[0]
+    : lights.find((l) => l.id === lightId);
+
+  if (!light) {
+    p.f('uLight', 0, 1, 0, 0);
+    p.f('uLightT', 5772);
+    p.f('uLightAng', 0.0046);
+    return;
+  }
+
+  deltaInto(this.t3, 0, light.pos, pos);
+
+  const dx = this.t3[0] as number;
+  const dy = this.t3[1] as number;
+  const dz = this.t3[2] as number;
+
+  const d = Math.hypot(dx, dy, dz) || 1;
+  const r = AU / d;
+
+  p.f('uLight', dx / d, dy / d, dz / d, light.lum * r * r);
+  p.f('uLightT', light.temp);
+  p.f('uLightAng', Math.asin(clamp(light.radius / d, 0, 1)));
+}
     deltaInto(this.t3, 0, sun.pos, pos);
     const dx = this.t3[0] as number;
     const dy = this.t3[1] as number;
@@ -1044,7 +1068,7 @@ export class Renderer {
       case 'body': {
         const R = o.radius;
         const t = o.tex ?? {};
-        this.sunUniforms(p, o.pos, scene.sun);
+        this.lightUniforms(p, o.pos, scene.lights, o.lightId);
         this.bindTex(0, t.albedo);
         this.bindTex(1, t.night);
         this.bindTex(2, t.clouds);
