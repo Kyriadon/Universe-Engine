@@ -698,9 +698,9 @@ export const BODY_FRAG =
   `
 uniform vec3 uSpin;
 uniform float uRot;
-uniform vec4 uSun;     // xyz: unit direction to the star, w: flux at the body
-uniform float uSunT;
-uniform float uSunAng; // angular radius of the star as seen from the body
+uniform vec4 uLight;     // xyz: unit direction to the star, w: flux at the body
+uniform float uLightT;
+uniform float uLightAng; // angular radius of the star as seen from the body
 uniform float uAtmH;   // atmosphere height, units of body radius (0 = airless)
 uniform vec3 uBetaR;   // Rayleigh scattering, per body radius
 uniform float uBetaM;  // Mie scattering, per body radius
@@ -900,8 +900,8 @@ void main() {
   vec2 ha = sphereHit(uCenterR, rd, Ra);
   vec2 hs = sphereHit(uCenterR, rd, 1.0);
   bool hitS = hs.x > 0.0;
-  vec3 L = uSun.xyz;
-  vec3 E = blackbody(uSunT) * uSun.w;
+  vec3 L = uLight.xyz;
+  vec3 E = blackbody(uLightT) * uLight.w;
   vec3 P = rd * hs.x - uCenterR;
   vec3 n = hitS ? normalize(P) : vec3(0.0, 1.0, 0.0);
   // derivatives are taken before any divergent control flow
@@ -980,7 +980,7 @@ void main() {
         float dO = max(length(oc), uOcc[i].w * 1.0001);
         float ao = asin(clamp(uOcc[i].w / dO, 0.0, 1.0));
         float sep = acos(clamp(dot(oc / dO, L), -1.0, 1.0));
-        float sa = max(uSunAng, 1e-6);
+        float sa = max(uLightAng, 1e-6);
         float cov = (1.0 - smoothstep(abs(sa - ao) + 1e-6, sa + ao, sep)) * min(1.0, ao * ao / (sa * sa));
         sh *= 1.0 - cov;
       }
@@ -1041,8 +1041,8 @@ export const RING_FRAG =
 uniform vec3 uNormal;
 uniform float uIn;
 uniform float uOut;
-uniform vec4 uSun;
-uniform float uSunT;
+uniform vec4 uLight;
+uniform float uLightT;
 uniform sampler2D uRingTex;
 uniform float uHasRing;
 uniform float uRingH;   // camera height above the ring plane, metres (computed in doubles on the CPU, so it stays exact at 1 m)
@@ -1140,8 +1140,8 @@ void main() {
   vec4 rt = uHasRing > 0.5
     ? texture(uRingTex, vec2(u, 0.5))
     : vec4(0.75, 0.70, 0.60, smoothstep(0.0, 0.1, u) * (1.0 - smoothstep(0.9, 1.0, u)) * 0.8);
-  vec3 L = uSun.xyz;
-  vec3 E = blackbody(uSunT) * uSun.w;
+  vec3 L = uLight.xyz;
+  vec3 E = blackbody(uLightT) * uLight.w;
   float b = dot(P, L);
   float sh = (b < 0.0 && dot(P, P) - b * b < 1.0) ? 0.0 : 1.0;
   float same = (sign(dot(N, L)) * sign(dot(N, -uCenterR)) > 0.0) ? 1.0 : 0.0;
