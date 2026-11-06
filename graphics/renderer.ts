@@ -867,7 +867,7 @@ export class Renderer {
     let s = this.scale;
     if (this.ema > 1 / 48) s -= 0.1;
     else if (this.ema < 1 / 58 && this.dynTick > 300) s += 0.05;
-    s = clamp(s, 0.75, 1); // never drop below 75 %: close-up surfaces and rings turn visibly soft below that
+    s = clamp(s, 0.90, 1); // never drop below 75 %: close-up surfaces and rings turn visibly soft below that
     if (Math.abs(s - this.scale) > 1e-3) {
       this.scale = s;
       this.buildTargets();
