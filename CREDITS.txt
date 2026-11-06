@@ -1,0 +1,27 @@
+Texture credits
+===============
+
+Source: CelestiaContent, https://github.com/CelestiaProject/CelestiaContent (textures/hires, 4096x2048).
+Full per-map credits are in that repository's README and .license files. Maps are NASA/JPL/USGS-derived composites,
+processed by the Celestia community. What was changed here: converted to JPEG, alpha channels dropped, and (for the nine
+maps that already existed in this project) a per-channel mean/std colour match to the previous map so the swap on zoom does
+not change the overall colour. Io, Europa, Ganymede and Callisto are unmodified apart from format/size.
+
+Per-map licences stated in CelestiaContent:
+  io            CC-BY-4.0   ItzImcool, AstroChara; NASA/JPL-Caltech/ASI/USGS; NASA/JPL/SwRI/MSSS/G. Eichstaedt/J. Perry/J. Rogers
+  ganymede      CC-BY-3.0   Askaniy Anpilogov; NASA/JPL-Caltech/ASI/USGS; B. Joensson; B. Swift
+  jupiter       CC-BY-3.0   Askaniy Anpilogov; NASA/JPL-Caltech/SSI/SwRI/MSSS/ASI/INAF/JIRAM; B. Joensson
+  saturn        CC-BY-3.0   Askaniy Anpilogov; NASA/JPL-Caltech; B. Joensson
+  neptune       CC-BY-3.0   Askaniy Anpilogov; NASA/JPL-Caltech; B. Joensson; Karkoschka 1994
+  uranus        CC-BY-NC-SA-3.0 (NON-COMMERCIAL, share-alike)   Askaniy Anpilogov; NASA/JPL-Caltech; B. Joensson; Simon et al. 2015
+  mercury, venus, mars, moon, earth, earth night/clouds, europa, callisto, saturn rings:
+                see the CelestiaContent README (USGS / NASA sources, Celestia community processing)
+
+solar/hi/earth_specular.jpg  is the alpha channel of CelestiaContent's earth.png (matched to hi/earth.jpg), mean-matched to the old mask.
+solar/hi/earth_height.jpg    is elev_bump_4k.jpg from https://github.com/turban/webgl-earth (images/), linearly rescaled to the value range of
+                       the previous textures/solar/earth_height.jpg. That repository states no licence or provenance in its README, so
+                       check it before redistributing.
+
+If you redistribute or sell this project, check these terms first; solar/hi/uranus.jpg is the restrictive one, solar/hi/earth_height.jpg is unverified.
+
+sun, sun_flare (textures/solar/ and textures/solar/hi/) are procedurally generated (no third-party imagery, no licence restrictions).

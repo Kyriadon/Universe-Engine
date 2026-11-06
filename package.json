@@ -1,0 +1,14 @@
+{
+  "name": "universe-engine",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit -p .",
+    "build": "esbuild graphics/solar/solar.ts --bundle --format=iife --global-name=Solar --outfile=dist/solar/solar.js",
+    "solar": "esbuild graphics/solar/solar.ts --bundle --format=iife --global-name=Solar --outfile=dist/solar/solar.js && esbuild --servedir=. --serve=8000"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2"
+  }
+}
