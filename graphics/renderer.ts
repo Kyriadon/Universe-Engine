@@ -979,16 +979,6 @@ private lightUniforms(
   p.f('uLightT', light.temp);
   p.f('uLightAng', Math.asin(clamp(light.radius / d, 0, 1)));
 }
-    deltaInto(this.t3, 0, sun.pos, pos);
-    const dx = this.t3[0] as number;
-    const dy = this.t3[1] as number;
-    const dz = this.t3[2] as number;
-    const d = Math.hypot(dx, dy, dz) || 1;
-    const r = AU / d;
-    p.f('uSun', dx / d, dy / d, dz / d, sun.lum * r * r);
-    p.f('uSunT', sun.temp);
-    p.f('uSunAng', Math.asin(clamp(sun.radius / d, 0, 1)));
-  }
 
   /** Bind program + all uniforms for one impostor. */
   private setup(im: Imp, scene: Scene, cam: Camera, bodies: BodyObj[]): { opaque: boolean; grab: boolean } {
