@@ -234,11 +234,19 @@ export type SceneObject =
   | WormholeObj
   | PulsarObj;
 
+export interface SceneLight {
+  readonly id: string;
+  pos: WorldPos;
+  lum: number;
+  temp: number;
+  radius: number;
+}
+
 export interface Scene {
   /** Seconds. Drives rotation, noise animation, pulsar phase. */
   time: number;
-  /** The light that illuminates bodies and rings. */
-  sun?: { pos: WorldPos; lum: number; temp: number; radius: number };
+  /** All stellar light sources in this scene. */
+  lights: SceneLight[];
   objects: SceneObject[];
 }
 
