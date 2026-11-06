@@ -1113,7 +1113,7 @@ private lightUniforms(
         return { opaque: true, grab: false };
       }
       case 'ring': {
-        this.sunUniforms(p, o.pos, scene.sun);
+        this.lightUniforms(p, o.pos, scene.lights, o.lightId);
         this.bindTex(9, o.tex);
         p.f('uHasRing', o.tex ? 1 : 0);
         p.v('uNormal', o.normal);
