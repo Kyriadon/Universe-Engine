@@ -479,6 +479,7 @@ export class Renderer {
   private prevTanY = 1;
   private prevTime = 0;
   private alphaTaa = 0.1;
+  private fastSimulation = false;
   private dprev = new Float64Array(3);
   private loops = new Float32Array(S.PROM_LOOPS * 12);
   private smearA = new Float32Array(32);
@@ -665,13 +666,30 @@ export class Renderer {
 
     // ---- 1b. temporal state: camera delta, cut detection, jitter
     deltaInto(this.dprev, 0, this.prevPos ?? cam.pos, cam.pos);
-    const stepLen = Math.hypot(this.dprev[0] as number, this.dprev[1] as number, this.dprev[2] as number);
+
+    const stepLen = Math.hypot(
+      this.dprev[0] as number,
+      this.dprev[1] as number,
+      this.dprev[2] as number
+    );
+
+    // scene.time advances in simulation seconds; dt is real frame time.
+    const simRate = Math.abs(scene.time - this.prevTime) /
+      Math.max(dt, 1e-3);
+
+    // Planetary surface motion is not represented in the camera-only TAA reprojection.
+    const fastSimulation = simRate > 1.25;
+    const fastSimulationChanged =
+      fastSimulation !== this.fastSimulation;
+
     const cut =
       this.cutNext ||
       this.prevPos === null ||
       dot(this.prevFwd, cam.forward) < 0.9 ||
       Math.abs(tanY / this.prevTanY - 1) > 0.15 ||
-      stepLen > 0.4 * minD;
+      stepLen > 0.4 * minD ||
+      fastSimulationChanged;
+
     if (cut) {
       this.dprev.fill(0);
       this.prevRight = cam.right;
@@ -682,18 +700,32 @@ export class Renderer {
       this.histValid = false;
       this.cutNext = false;
     }
-    const rate = Math.abs(scene.time - this.prevTime) / Math.max(dt, 1e-3);
-    this.alphaTaa = 0.1 + 0.5 * clamp(Math.log2(Math.max(rate, 1)) / 6, 0, 1); // fast time warp: trust history less
+
+    this.fastSimulation = fastSimulation;
+
+    // At accelerated time, use current-frame spatial reconstruction without old-frame accumulation.
+    this.alphaTaa = fastSimulation
+      ? 1.0
+      : 0.1 + 0.5 * clamp(
+          Math.log2(Math.max(simRate, 1)) / 6,
+          0,
+          1
+        );
+
     this.prevTime = scene.time;
+
+    // Temporal jitter only helps when history is being accumulated.
     const hj = (this.frame % 16) + 1;
-    const jpx = this.temporal ? halton(hj, 2) - 0.5 : 0;
-    const jpy = this.temporal ? halton(hj, 3) - 0.5 : 0;
+    const useTemporalJitter = this.temporal && !fastSimulation;
+    const jpx = useTemporalJitter ? halton(hj, 2) - 0.5 : 0;
+    const jpy = useTemporalJitter ? halton(hj, 3) - 0.5 : 0;
+
     this.fu = {
       right: cam.right, up: cam.up, fwd: cam.forward, tanX, tanY, w: W, h: H, sr: (2 * tanY / H) ** 2, time: scene.time,
       jx: (2 * jpx) / W, jy: (2 * jpy) / H, jpx, jpy,
       pRight: this.prevRight, pUp: this.prevUp, pFwd: this.prevFwd, ptx: this.prevTanX, pty: this.prevTanY,
       drx: this.dprev[0] as number, dry: this.dprev[1] as number, drz: this.dprev[2] as number,
-      mbOn: this.mbShutter > 0 && !cut,
+      mbOn: this.mbShutter > 0 && !cut && !fastSimulation,
       maxPx: 0.06 * H,
     };
 
@@ -1209,7 +1241,7 @@ private lightUniforms(
     p.f('uOutRes', dst.w, dst.h);
     p.f('uJitterPx', this.fu.jpx, this.fu.jpy);
     p.f('uAlpha', this.alphaTaa);
-    p.f('uReset', this.histValid ? 0 : 1);
+    p.f('uReset', this.histValid && !this.fastSimulation ? 0 : 1);
     this.setReproj(p);
     this.tri();
     this.histIdx = 1 - this.histIdx;

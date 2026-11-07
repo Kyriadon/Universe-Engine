@@ -461,6 +461,13 @@ export function startSolar(canvas: HTMLCanvasElement): () => void {
   let simSeconds = 0;
   let rate = 1;
   let savedRate = 1;
+
+  const setTimeRate = (next: number): void => {
+    if (next === rate) return;
+
+    rate = next;
+    renderer.resetTemporal();
+  };
   let anchor = 'sun';
   let camOff: V3 = [0, 3.0e9, 2.2e11]; // relative to the anchor, metres
   let fwd: V3 = [0, -0.01, -1];
@@ -524,15 +531,26 @@ export function startSolar(canvas: HTMLCanvasElement): () => void {
     keys.add(e.code);
     if (e.code === 'Space' || e.code.startsWith('Arrow')) e.preventDefault();
     const digit = /^Digit(\d)$/.exec(e.code);
-    if (digit) jump(HOTKEYS[Number(digit[1])] ?? 'sun');
-    else if (e.code === 'Period') rate = rate === 0 ? savedRate * 4 : rate * 4;
-    else if (e.code === 'Comma') rate = rate === 0 ? savedRate / 4 : rate / 4;
-    else if (e.code === 'Slash') rate = 1;
+
+    if (digit) {
+      jump(HOTKEYS[Number(digit[1])] ?? 'sun');
+    }
+    else if (e.code === 'Period') {
+      setTimeRate(rate === 0 ? savedRate * 4 : rate * 4);
+    }
+    else if (e.code === 'Comma') {
+      setTimeRate(rate === 0 ? savedRate / 4 : rate / 4);
+    }
+    else if (e.code === 'Slash') {
+      savedRate = 1;
+      setTimeRate(1);
+    }
     else if (e.code === 'KeyP') {
-      if (rate === 0) rate = savedRate;
-      else {
+      if (rate === 0) {
+        setTimeRate(savedRate);
+      } else {
         savedRate = rate;
-        rate = 0;
+        setTimeRate(0);
       }
     }
   };
