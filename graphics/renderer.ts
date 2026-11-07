@@ -722,7 +722,7 @@ export class Renderer {
 
     this.fastSimulation = fastSimulation;
 
-    // At accelerated time, use current-frame spatial reconstruction without old-frame accumulation.
+    // Increase the current-frame contribution as simulation time advances faster than wall time.
     this.alphaTaa = 0.1 + 0.2 * clamp(
       Math.log2(Math.max(simRate, 1)) / 6,
       0,
@@ -866,8 +866,8 @@ export class Renderer {
             prevZ = (this.t3[2] as number) / body.radius;
           }
 
-          // Flowing clouds, zonal jets, vortices and dust storms have independent
-          // surface-space motion; reject their history rather than reprojecting it incorrectly.
+          // Pass the previous body transform and scene time; the shader handles animated
+          // surface effects per pixel instead of disabling history for the entire planet.
           P.body.f('uPrevBodyCenterR', prevX, prevY, prevZ);
           P.body.v('uPrevSpin', previous?.spin ?? body.spin);
           P.body.f('uPrevRot', previous?.rot ?? body.rot);

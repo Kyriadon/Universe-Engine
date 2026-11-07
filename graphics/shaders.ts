@@ -1001,7 +1001,7 @@ void main() {
         float currentFlowOffset = zonalFlowOffset(latitude, uTime);
         float previousFlowOffset = zonalFlowOffset(latitude, uPrevTime);
         bodyLongitude += 2.0 * PI * (currentFlowOffset - previousFlowOffset);
-        historyCurrentWeight = 0.45;
+        historyCurrentWeight = clamp(0.45 + 0.08 * abs(uTime - uPrevTime), 0.45, 0.9);
       }
     }
 
