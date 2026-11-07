@@ -118,7 +118,7 @@ export function createTarget(
   gl.bindTexture(gl.TEXTURE_2D, tex);
   const levels = o.mips ? Math.floor(Math.log2(Math.max(w, h))) + 1 : 1;
   gl.texStorage2D(gl.TEXTURE_2D, levels, fmt, w, h);
-  const nearest = fmt === gl.R32F;
+  const nearest = fmt === gl.R32F || fmt === gl.RGBA32F;
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, nearest ? gl.NEAREST : o.mips ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, nearest ? gl.NEAREST : gl.LINEAR);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);

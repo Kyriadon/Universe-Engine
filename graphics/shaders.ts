@@ -703,6 +703,7 @@ uniform float uPrevBodyValid;
 uniform vec3 uPrevBodyCenterR;
 uniform vec3 uPrevSpin;
 uniform float uPrevRot;
+uniform float uPrevTime;
 uniform float uPrevRadiusRatio;
 uniform vec4 uLight;     // xyz: unit direction to the star, w: flux at the body
 uniform float uLightT;
@@ -759,7 +760,7 @@ vec2 vortexWarp(vec2 s) {
 
 // Mars-style regional dust storms (stylised, procedural): four cells bloom, drift east and fade, each life starting at
 // a new place. Scene time, so they speed up with the simulation.
-vec3 dustStorms(vec3 alb, vec2 uv) {
+float dustStormAmount(vec2 uv) {
   float lon = (uv.x - 0.5) * 2.0 * PI;
   float lat = (0.5 - uv.y) * PI;
   vec3 p = vec3(cos(lat) * cos(lon), sin(lat), cos(lat) * sin(lon));
@@ -778,7 +779,34 @@ vec3 dustStorms(vec3 alb, vec2 uv) {
     float k = sin(life * PI);
     dust += k * k * (1.0 - smoothstep(0.0, size * (0.6 + 0.8 * rag), d));
   }
+  return dust;
+}
+vec3 dustStorms(vec3 alb, vec2 uv) {
+  float dust = dustStormAmount(uv);
   return mix(alb, vec3(0.58, 0.36, 0.19), clamp(dust * 0.6 * uStorm, 0.0, 0.85));
+}
+
+// The cross-faded pair of zonal-flow maps has one effective longitude per pixel.
+// Returning its weighted coordinate lets TAA follow the moving pattern between frames.
+float zonalFlowOffset(float latitude, float time) {
+  float jet = sin(latitude * 6.0) * 0.03 * uFlow;
+  float p0 = fract(time / 50.0);
+  float p1 = fract(p0 + 0.5);
+  float w0 = 1.0 - abs(2.0 * p0 - 1.0);
+  return mix(jet * (p1 - 0.5), jet * (p0 - 0.5), w0);
+}
+
+// Weight of the local Great Red Spot warp. Its neighbourhood is intentionally history-rejected
+// because it combines two differently warped samples and has no single exact pixel velocity.
+float vortexInfluence(vec2 s) {
+  float lon0 = (uVortex.x - 0.5) * 2.0 * PI;
+  float lat0 = (0.5 - uVortex.y) * PI;
+  float cl = max(cos(lat0), 0.2);
+  float dl = (s.x - 0.5) * 2.0 * PI - lon0;
+  dl -= 2.0 * PI * floor((dl + PI) / (2.0 * PI));
+  vec2 d = vec2(dl * cl, (0.5 - s.y) * PI - lat0);
+  vec2 e = vec2(d.x / 1.5, d.y) / uVortex.z;
+  return exp(-2.0 * dot(e, e));
 }
 // Catmull-Rom reconstruction (5 filtered taps). Plain bilinear turns a magnified texel into a soft diamond; this keeps it crisp.
 vec3 sampCubic(sampler2D t, vec2 uv, vec2 gx, vec2 gy) {
@@ -934,15 +962,11 @@ void main() {
   if (ha.y < 0.0 || (!hitS && uAtmH <= 0.0)) discard;
 
   if (uMotionPass > 0.5) {
-    // Atmosphere-only pixels and independently animated surface effects must not reuse
-    // history. Static surface texels are mapped back to their previous world-space location.
     if (!hitS || uPrevBodyValid < 0.5) {
       oColor = vec4(0.0);
       return;
     }
 
-    // Preserve the exact body-fixed longitude/latitude from bodyUv(), even if the
-    // spin axis itself changed between frames.
     vec3 axisNow = normalize(uSpin);
     vec3 uNow = normalize(cross(axisNow, abs(axisNow.y) < 0.99
       ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0)));
@@ -950,7 +974,43 @@ void main() {
     vec3 qNow = vec3(dot(n, uNow), dot(n, axisNow), dot(n, vNow));
     float bodyLongitude = atan(qNow.z, qNow.x) - uRot;
     float bodyCosLat = length(qNow.xz);
+    float latitude = asin(clamp(qNow.y, -1.0, 1.0));
 
+    float historyCurrentWeight = 0.0;
+    bool historyValid = true;
+
+    // Earth-like moving cloud layer: only cloud-covered pixels reject history.
+    if (uFlow > 0.0 && uHas.y > 0.5) {
+      vec2 cloudUv = uv;
+      cloudUv.x += uTime * 0.0009 * uFlow;
+      float cloudCoverage = texG(uClouds, cloudUv, gx, gy).r;
+      if (cloudCoverage > 0.001) historyValid = false;
+    }
+
+    // Moving dust storms are rejected only where the storm currently changes albedo.
+    if (uStorm > 0.0 && dustStormAmount(uv) * 0.6 * uStorm > 0.001) {
+      historyValid = false;
+    }
+
+    // Gas-giant zonal bands move independently of solid-body rotation. Track the effective
+    // cross-faded longitude; use more current-frame weight because the pair is not a single layer.
+    if (uFlow > 0.0 && uHas.y < 0.5 && uHasAlbedo > 0.5) {
+      if (uVortex.w > 0.0 && vortexInfluence(uv) > 0.002) {
+        historyValid = false;
+      } else {
+        float currentFlowOffset = zonalFlowOffset(latitude, uTime);
+        float previousFlowOffset = zonalFlowOffset(latitude, uPrevTime);
+        bodyLongitude += 2.0 * PI * (currentFlowOffset - previousFlowOffset);
+        historyCurrentWeight = 0.45;
+      }
+    }
+
+    if (!historyValid) {
+      oColor = vec4(0.0);
+      return;
+    }
+
+    // Rebuild the previous-frame normal from the same body-fixed longitude/latitude.
     vec3 axisPrev = normalize(uPrevSpin);
     vec3 uPrev = normalize(cross(axisPrev, abs(axisPrev.y) < 0.99
       ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0)));
@@ -960,7 +1020,6 @@ void main() {
                + axisPrev * qNow.y
                + previousV * (sin(previousLongitude) * bodyCosLat);
 
-    // Previous body centre relative to the previous camera, in current body radii.
     vec3 qPrev = uPrevBodyCenterR + nPrev * uPrevRadiusRatio - uPrevRel / uRad;
     vec3 vPrev = vec3(
       dot(qPrev, uPrevRight),
@@ -973,7 +1032,7 @@ void main() {
     }
 
     vec2 prevNdc = vPrev.xy / (vPrev.z * uPrevTan);
-    oColor = vec4(prevNdc * 0.5 + 0.5, 0.0, 1.0);
+    oColor = vec4(prevNdc * 0.5 + 0.5, historyCurrentWeight, 1.0);
     return;
   }
 
@@ -1745,6 +1804,7 @@ uniform vec2 uOutRes;
 uniform vec2 uJitterPx;
 uniform float uAlpha;
 uniform float uReset;
+uniform float uFastSimulation;
 float lum3(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
 vec3 cs(vec3 c) { return c / (1.0 + lum3(c)); }
 vec3 ics(vec3 c) { return c / max(1.0 - lum3(c), 1e-4); }
@@ -1808,6 +1868,7 @@ void main() {
   vec3 res = cur;
   vec2 hp;
   bool ok = false;
+  float bodyCurrentWeight = 0.0;
   vec2 ndc = vUv * 2.0 - 1.0;
   if (uReset < 0.5) {
     vec4 bodyMotion = texelFetch(uBodyMotion, nearestT, 0);
@@ -1820,10 +1881,11 @@ void main() {
       // must reject history rather than fall back to camera-only reprojection.
       if (bodyMotion.a > 0.5) {
         hp = bodyMotion.xy;
+        bodyCurrentWeight = bodyMotion.z;
         ok = all(greaterThanEqual(hp, vec2(0.0)))
           && all(lessThanEqual(hp, vec2(1.0)));
       }
-    } else {
+    } else if (uFastSimulation < 0.5) {
       vec3 rd = normalize(uCamFwd + ndc.x * uTanHalf.x * uCamRight + ndc.y * uTanHalf.y * uCamUp);
       ok = prevNdc(rd, distOf(zMin), hp);
       hp = hp * 0.5 + 0.5;
@@ -1839,7 +1901,10 @@ void main() {
     float k = max(max(abs(dir.x) / ext.x, abs(dir.y) / ext.y), max(abs(dir.z) / ext.z, 1.0));
     h = m1 + dir / k;
     float vpx = length((hp - vUv) * uOutRes);
-    float a = mix(uAlpha, max(uAlpha, 0.3), clamp(vpx / 8.0, 0.0, 1.0));
+    float a = max(
+      mix(uAlpha, max(uAlpha, 0.3), clamp(vpx / 8.0, 0.0, 1.0)),
+      bodyCurrentWeight
+    );
     res = mix(h, cur, a);
   }
   o = vec4(ics(res), 1.0);

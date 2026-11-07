@@ -355,6 +355,7 @@ interface BodyFrameState {
   spin: Vec3;
   rot: number;
   radius: number;
+  time: number;
   frame: number;
 }
 
@@ -722,19 +723,17 @@ export class Renderer {
     this.fastSimulation = fastSimulation;
 
     // At accelerated time, use current-frame spatial reconstruction without old-frame accumulation.
-    this.alphaTaa = fastSimulation
-      ? 1.0
-      : 0.1 + 0.5 * clamp(
-          Math.log2(Math.max(simRate, 1)) / 6,
-          0,
-          1
-        );
+    this.alphaTaa = 0.1 + 0.2 * clamp(
+      Math.log2(Math.max(simRate, 1)) / 6,
+      0,
+      1
+    );
 
     this.prevTime = scene.time;
 
     // Temporal jitter only helps when history is being accumulated.
     const hj = (this.frame % 16) + 1;
-    const useTemporalJitter = this.temporal && !fastSimulation;
+    const useTemporalJitter = this.temporal;
     const jpx = useTemporalJitter ? halton(hj, 2) - 0.5 : 0;
     const jpy = useTemporalJitter ? halton(hj, 3) - 0.5 : 0;
 
@@ -847,7 +846,7 @@ export class Renderer {
       gl.clearDepth(1);
       gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
-      if (!cut && !this.fastSimulation) {
+      if (!cut) {
         gl.bindVertexArray(this.quadVao);
         for (const im of imps) {
           if (im.o.kind !== 'body') continue;
@@ -869,12 +868,12 @@ export class Renderer {
 
           // Flowing clouds, zonal jets, vortices and dust storms have independent
           // surface-space motion; reject their history rather than reprojecting it incorrectly.
-          const animatedSurface = (body.flow ?? 0) > 0 || (body.storm ?? 0) > 0;
           P.body.f('uPrevBodyCenterR', prevX, prevY, prevZ);
           P.body.v('uPrevSpin', previous?.spin ?? body.spin);
           P.body.f('uPrevRot', previous?.rot ?? body.rot);
+          P.body.f('uPrevTime', previous?.time ?? scene.time);
           P.body.f('uPrevRadiusRatio', previous ? previous.radius / body.radius : 1);
-          P.body.f('uPrevBodyValid', previous && !animatedSurface ? 1 : 0);
+          P.body.f('uPrevBodyValid', previous ? 1 : 0);
           P.body.f('uMotionPass', 1);
           gl.depthMask(true);
           gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
@@ -892,6 +891,7 @@ export class Renderer {
         spin: [body.spin[0], body.spin[1], body.spin[2]],
         rot: body.rot,
         radius: body.radius,
+        time: scene.time,
         frame: this.frame,
       });
     }
@@ -960,7 +960,7 @@ export class Renderer {
     const H = Math.max(2, Math.round(ch * this.scale));
     this.hdr = createTarget(gl, W, H, gl.RGBA16F, { depthTexture: true, mips: true });
     this.copy = createTarget(gl, W, H, gl.RGBA16F);
-    this.motion = this.temporal ? createTarget(gl, W, H, gl.RGBA16F, { depthTexture: true }) : null;
+    this.motion = this.temporal ? createTarget(gl, W, H, gl.RGBA32F, { depthTexture: true }) : null;
     // Size of the image the post chain works on: canvas resolution once temporal upscaling reconstructs it.
     const FW = this.temporal ? cw : W;
     const FH = this.temporal ? ch : H;
@@ -1328,7 +1328,8 @@ private lightUniforms(
     p.f('uOutRes', dst.w, dst.h);
     p.f('uJitterPx', this.fu.jpx, this.fu.jpy);
     p.f('uAlpha', this.alphaTaa);
-    p.f('uReset', this.histValid && !this.fastSimulation ? 0 : 1);
+    p.f('uReset', this.histValid ? 0 : 1);
+    p.f('uFastSimulation', this.fastSimulation ? 1 : 0);
     this.setReproj(p);
     this.tri();
     this.histIdx = 1 - this.histIdx;
