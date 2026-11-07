@@ -954,11 +954,11 @@ void main() {
     vec3 axisPrev = normalize(uPrevSpin);
     vec3 uPrev = normalize(cross(axisPrev, abs(axisPrev.y) < 0.99
       ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0)));
-    vec3 vPrev = cross(axisPrev, uPrev);
+    vec3 previousV = cross(axisPrev, uPrev);
     float previousLongitude = bodyLongitude + uPrevRot;
     vec3 nPrev = uPrev * (cos(previousLongitude) * bodyCosLat)
                + axisPrev * qNow.y
-               + vPrev * (sin(previousLongitude) * bodyCosLat);
+               + previousV * (sin(previousLongitude) * bodyCosLat);
 
     // Previous body centre relative to the previous camera, in current body radii.
     vec3 qPrev = uPrevBodyCenterR + nPrev * uPrevRadiusRatio - uPrevRel / uRad;
