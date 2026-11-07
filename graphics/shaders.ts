@@ -760,14 +760,14 @@ vec2 vortexWarp(vec2 s) {
 
 // Mars-style regional dust storms (stylised, procedural): four cells bloom, drift east and fade, each life starting at
 // a new place. Scene time, so they speed up with the simulation.
-float dustStormAmount(vec2 uv) {
+float dustStormAmount(vec2 uv, float time) {
   float lon = (uv.x - 0.5) * 2.0 * PI;
   float lat = (0.5 - uv.y) * PI;
   vec3 p = vec3(cos(lat) * cos(lon), sin(lat), cos(lat) * sin(lon));
   float dust = 0.0;
   for (int i = 0; i < 4; i++) {
     float fi = float(i);
-    float t = uTime / 240.0 + fi * 0.25;
+    float t = time / 240.0 + fi * 0.25;
     float life = fract(t);
     float cyc = floor(t) * 4.0 + fi;
     float la = (hash13(vec3(cyc, 1.7, 3.1)) - 0.5) * 1.4;
@@ -775,19 +775,19 @@ float dustStormAmount(vec2 uv) {
     float size = 0.1 + 0.14 * hash13(vec3(cyc, 8.9, 2.3));
     vec3 c = vec3(cos(la) * cos(lo), sin(la), cos(la) * sin(lo));
     float d = acos(clamp(dot(p, c), -1.0, 1.0));
-    float rag = vnoise(p * 9.0 + vec3(fi * 11.0, 0.0, uTime * 0.01));
+    float rag = vnoise(p * 9.0 + vec3(fi * 11.0, 0.0, time * 0.01));
     float k = sin(life * PI);
     dust += k * k * (1.0 - smoothstep(0.0, size * (0.6 + 0.8 * rag), d));
   }
   return dust;
 }
 vec3 dustStorms(vec3 alb, vec2 uv) {
-  float dust = dustStormAmount(uv);
+  float dust = dustStormAmount(uv, uTime);
   return mix(alb, vec3(0.58, 0.36, 0.19), clamp(dust * 0.6 * uStorm, 0.0, 0.85));
 }
 
-// The cross-faded pair of zonal-flow maps has one effective longitude per pixel.
-// Returning its weighted coordinate lets TAA follow the moving pattern between frames.
+// Approximate the cross-faded pair of zonal-flow samples by its weighted mean longitude.
+// The TAA current-frame weight rises with the simulation step to limit blend residuals.
 float zonalFlowOffset(float latitude, float time) {
   float jet = sin(latitude * 6.0) * 0.03 * uFlow;
   float p0 = fract(time / 50.0);
@@ -981,15 +981,22 @@ void main() {
 
     // Earth-like moving cloud layer: only cloud-covered pixels reject history.
     if (uFlow > 0.0 && uHas.y > 0.5) {
-      vec2 cloudUv = uv;
-      cloudUv.x += uTime * 0.0009 * uFlow;
-      float cloudCoverage = texG(uClouds, cloudUv, gx, gy).r;
-      if (cloudCoverage > 0.001) historyValid = false;
+      vec2 cloudUvNow = uv;
+      vec2 cloudUvPrev = uv;
+      cloudUvNow.x += uTime * 0.0009 * uFlow;
+      cloudUvPrev.x += uPrevTime * 0.0009 * uFlow;
+      float cloudNow = texG(uClouds, cloudUvNow, gx, gy).r;
+      float cloudPrev = texG(uClouds, cloudUvPrev, gx, gy).r;
+      if (max(cloudNow, cloudPrev) > 0.001) historyValid = false;
     }
 
-    // Moving dust storms are rejected only where the storm currently changes albedo.
-    if (uStorm > 0.0 && dustStormAmount(uv) * 0.6 * uStorm > 0.001) {
-      historyValid = false;
+    // Reject history if a moving dust feature affects this surface point in either frame.
+    if (uStorm > 0.0) {
+      float dustNow = dustStormAmount(uv, uTime);
+      float dustPrev = dustStormAmount(uv, uPrevTime);
+      if (max(dustNow, dustPrev) * 0.6 * uStorm > 0.001) {
+        historyValid = false;
+      }
     }
 
     // Gas-giant zonal bands move independently of solid-body rotation. Track the effective
