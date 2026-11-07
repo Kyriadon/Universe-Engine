@@ -350,6 +350,26 @@ const norm = (a: Vec3): Vec3 => {
   return [a[0] / l, a[1] / l, a[2] / l];
 };
 
+// Per-planet visual recalibration. Temporal history can pick up small errors on a planet whose surface keeps
+// moving (each frame resamples the history, and ordinary surfaces keep up to 90% of it), so after significant
+// rotation that planet alone drops its history (current-frame weight 1) and rebuilds it as an equal-weight
+// running mean of the Halton-jittered frames (1, 1/2, 1/3, ...), then normal TAA resumes. Stars, galaxies and
+// other planets keep their own histories.
+
+/** Recalibration length in frames: one full cycle of the 16-point Halton jitter. */
+const RECAL_FRAMES = 16;
+/** Rotation-induced surface displacement (output px per frame) at which a planet counts as moving fast. */
+const RECAL_FAST_PX = 3;
+/** ...and the displacement below which it counts as settled again (lower than the above, so it cannot flicker). */
+const RECAL_SETTLED_PX = 1.5;
+
+interface Recal {
+  /** Frames since the last recalibration began; RECAL_FRAMES or more means it has finished. */
+  age: number;
+  /** The surface is moving fast, so its history is held discarded until it settles. */
+  moving: boolean;
+}
+
 interface BodyFrameState {
   pos: WorldPos;
   spin: Vec3;
@@ -357,6 +377,52 @@ interface BodyFrameState {
   radius: number;
   time: number;
   frame: number;
+  /** Recalibration state; null when the planet was not drawn that frame, so it has no usable history. */
+  recal: Recal | null;
+}
+
+/** Share of the current frame in a recalibrating planet's pixels: 1 on its first frame, then 1/2, 1/3, ... and 0 once finished. */
+const recalWeight = (age: number): number => (age >= RECAL_FRAMES ? 0 : 1 / (age + 1));
+
+/** Angle wrapped to [-PI, PI]. */
+const wrapPi = (a: number): number => a - 2 * Math.PI * Math.round(a / (2 * Math.PI));
+
+/**
+ * Advance one planet's recalibration by a frame. A recalibration starts when the planet has no usable history
+ * (first frame, or it was not drawn last frame), when its surface starts moving fast and again when it settles,
+ * and when accelerated simulation returns to normal; while it moves fast its history stays discarded.
+ * `pxPerRad` is output pixels per radian at the screen centre; the displacement estimated is how far the
+ * fastest part of the visible surface travels on screen between the two frames because of the planet's rotation.
+ */
+function stepRecal(
+  prev: BodyFrameState | undefined,
+  body: BodyObj,
+  distance: number,
+  pxPerRad: number,
+  simReturned: boolean
+): Recal {
+  const last = prev?.recal;
+  if (!prev || !last) return { age: 0, moving: false };
+
+  const a0 = norm(prev.spin);
+  const a1 = norm(body.spin);
+  const turn = Math.hypot(
+    wrapPi(body.rot - prev.rot),
+    Math.hypot(a1[0] - a0[0], a1[1] - a0[1], a1[2] - a0[2])
+  );
+  const discRad = Math.asin(Math.min(1, body.radius / Math.max(distance, 1e-9)));
+  const px = turn * discRad * pxPerRad;
+
+  let age = last.age + 1;
+  let moving = last.moving;
+  if (!moving && px >= RECAL_FAST_PX) {
+    moving = true;
+  } else if (moving && px < RECAL_SETTLED_PX) {
+    moving = false;
+    age = 0;
+  }
+  if (moving || simReturned) age = 0;
+  return { age: Math.min(age, RECAL_FRAMES), moving };
 }
 
 function copyWorldPos(pos: WorldPos): WorldPos {
@@ -486,6 +552,7 @@ export class Renderer {
   private histIdx = 0;
   private histValid = false;
   private bodyHistory = new WeakMap<BodyObj, BodyFrameState>();
+  private recalNow = new Map<BodyObj, Recal>();
   private temporal: boolean;
   private mbShutter: number;
   private flareK: number;
@@ -700,6 +767,7 @@ export class Renderer {
     const fastSimulation = simRate > 1.25;
     const fastSimulationChanged =
       fastSimulation !== this.fastSimulation;
+    const simReturnedToNormal = this.fastSimulation && !fastSimulation;
 
     const cut =
       this.cutNext ||
@@ -834,6 +902,19 @@ export class Renderer {
       }
     }
 
+    // Per-planet visual recalibration: advance each drawn planet's state; the motion pass below writes its weight.
+    this.recalNow.clear();
+    if (this.motion) {
+      const pxPerRad = (0.5 * this.canvas.height) / tanY;
+      for (const im of imps) {
+        if (im.o.kind !== 'body') continue;
+        const body = im.o;
+        const cached = this.bodyHistory.get(body);
+        const previous = cached?.frame === this.frame - 1 ? cached : undefined;
+        this.recalNow.set(body, stepRecal(previous, body, im.d, pxPerRad, simReturnedToNormal));
+      }
+    }
+
     // Planet surface motion: render the bodies a second time into a small UV/depth buffer.
     // TAA can then follow the same material point instead of assuming the planet is stationary.
     if (this.motion) {
@@ -874,6 +955,7 @@ export class Renderer {
           P.body.f('uPrevTime', previous?.time ?? scene.time);
           P.body.f('uPrevRadiusRatio', previous ? previous.radius / body.radius : 1);
           P.body.f('uPrevBodyValid', previous ? 1 : 0);
+          P.body.f('uRecalWeight', recalWeight(this.recalNow.get(body)?.age ?? RECAL_FRAMES));
           P.body.f('uMotionPass', 1);
           gl.depthMask(true);
           gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
@@ -893,6 +975,7 @@ export class Renderer {
         radius: body.radius,
         time: scene.time,
         frame: this.frame,
+        recal: this.recalNow.get(body) ?? null,
       });
     }
 
