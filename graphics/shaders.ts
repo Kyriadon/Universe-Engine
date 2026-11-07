@@ -705,6 +705,7 @@ uniform vec3 uPrevSpin;
 uniform float uPrevRot;
 uniform float uPrevTime;
 uniform float uPrevRadiusRatio;
+uniform float uRecalWeight;   // per-planet recalibration: share of the current frame forced into this planet's pixels (1 = history discarded)
 uniform vec4 uLight;     // xyz: unit direction to the star, w: flux at the body
 uniform float uLightT;
 uniform float uLightAng; // angular radius of the star as seen from the body
@@ -1016,6 +1017,10 @@ void main() {
       oColor = vec4(0.0);
       return;
     }
+
+    // Per-planet visual recalibration: while the renderer rebuilds this planet's appearance it asks for a larger
+    // share of the current frame (1 discards the history outright). Only this planet's pixels carry it.
+    historyCurrentWeight = max(historyCurrentWeight, uRecalWeight);
 
     // Rebuild the previous-frame normal from the same body-fixed longitude/latitude.
     vec3 axisPrev = normalize(uPrevSpin);
