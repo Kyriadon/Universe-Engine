@@ -350,6 +350,19 @@ const norm = (a: Vec3): Vec3 => {
   return [a[0] / l, a[1] / l, a[2] / l];
 };
 
+interface BodyFrameState {
+  pos: WorldPos;
+  rot: number;
+}
+
+function copyWorldPos(pos: WorldPos): WorldPos {
+  return {
+    tier: pos.tier,
+    sector: [pos.sector[0], pos.sector[1], pos.sector[2]],
+    local: [pos.local[0], pos.local[1], pos.local[2]],
+  };
+}
+
 /** Impostor extent as a multiple of obj.radius: covers halos, atmospheres, discs, the lens region. */
 function extentOf(o: SceneObject): number {
   switch (o.kind) {
@@ -465,8 +478,10 @@ export class Renderer {
   private flare: Target | null = null;
   private mb: Target | null = null;
   private hist: Target[] = [];
+  private motion: Target | null = null;
   private histIdx = 0;
   private histValid = false;
+  private bodyHistory = new WeakMap<BodyObj, BodyFrameState>();
   private temporal: boolean;
   private mbShutter: number;
   private flareK: number;
@@ -817,6 +832,58 @@ export class Renderer {
       }
     }
 
+    // Planet surface motion: render the bodies a second time into a small UV/depth buffer.
+    // TAA can then follow the same material point instead of assuming the planet is stationary.
+    if (this.motion) {
+      this.target(this.motion);
+      gl.disable(gl.BLEND);
+      gl.enable(gl.DEPTH_TEST);
+      gl.depthFunc(gl.LEQUAL);
+      gl.depthMask(true);
+      gl.clearColor(0, 0, 0, 0);
+      gl.clearDepth(1);
+      gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+      if (!cut && !this.fastSimulation) {
+        gl.bindVertexArray(this.quadVao);
+        for (const im of imps) {
+          if (im.o.kind !== 'body') continue;
+
+          const body = im.o;
+          this.setup(im, scene, cam, bodies);
+
+          const previous = this.bodyHistory.get(body);
+          let prevX = 0;
+          let prevY = 0;
+          let prevZ = 0;
+          if (previous) {
+            deltaInto(this.t3, 0, previous.pos, cam.pos);
+            prevX = (this.t3[0] as number) / body.radius;
+            prevY = (this.t3[1] as number) / body.radius;
+            prevZ = (this.t3[2] as number) / body.radius;
+          }
+
+          // Flowing clouds, zonal jets, vortices and dust storms have independent
+          // surface-space motion; reject their history rather than reprojecting it incorrectly.
+          const animatedSurface = (body.flow ?? 0) > 0 || (body.storm ?? 0) > 0;
+          P.body.f('uPrevBodyCenterR', prevX, prevY, prevZ);
+          P.body.f('uPrevRotDelta', previous ? body.rot - previous.rot : 0);
+          P.body.f('uPrevBodyValid', previous && !animatedSurface ? 1 : 0);
+          P.body.f('uMotionPass', 1);
+          gl.depthMask(true);
+          gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        }
+      }
+
+      gl.disable(gl.DEPTH_TEST);
+      gl.depthMask(false);
+    }
+
+    // Snapshot body transforms after the motion pass so next frame has the exact previous state.
+    for (const body of bodies) {
+      this.bodyHistory.set(body, { pos: copyWorldPos(body.pos), rot: body.rot });
+    }
+
     // remember this frame's camera for the next frame's reprojection
     this.prevPos = cam.pos;
     this.prevRight = cam.right;
@@ -840,6 +907,7 @@ export class Renderer {
     this.tiles.clear();
     for (const t of [this.hdr, this.copy, this.lum, ...this.expo, ...this.bloom, ...this.hist]) destroyTarget(gl, t);
     if (this.flare) destroyTarget(gl, this.flare);
+    if (this.motion) destroyTarget(gl, this.motion);
     if (this.mb) destroyTarget(gl, this.mb);
     for (const p of Object.values(this.P)) gl.deleteProgram(p.program);
     gl.deleteBuffer(this.quadBuf);
@@ -873,13 +941,14 @@ export class Renderer {
 
   private buildTargets(): void {
     const gl = this.gl;
-    for (const t of [this.hdr, this.copy, this.flare, this.mb, ...this.bloom]) if (t) destroyTarget(gl, t);
+    for (const t of [this.hdr, this.copy, this.flare, this.mb, this.motion, ...this.bloom]) if (t) destroyTarget(gl, t);
     const cw = this.canvas.width;
     const ch = this.canvas.height;
     const W = Math.max(2, Math.round(cw * this.scale));
     const H = Math.max(2, Math.round(ch * this.scale));
     this.hdr = createTarget(gl, W, H, gl.RGBA16F, { depthTexture: true, mips: true });
     this.copy = createTarget(gl, W, H, gl.RGBA16F);
+    this.motion = this.temporal ? createTarget(gl, W, H, gl.RGBA16F, { depthTexture: true }) : null;
     // Size of the image the post chain works on: canvas resolution once temporal upscaling reconstructs it.
     const FW = this.temporal ? cw : W;
     const FH = this.temporal ? ch : H;
@@ -1090,6 +1159,8 @@ private lightUniforms(
       case 'body': {
         const R = o.radius;
         const t = o.tex ?? {};
+        p.f('uMotionPass', 0);
+        p.f('uPrevBodyValid', 0);
         this.lightUniforms(p, o.pos, scene.lights, o.lightId);
         this.bindTex(0, t.albedo);
         this.bindTex(1, t.night);
@@ -1232,6 +1303,10 @@ private lightUniforms(
     this.bindTex(2, src.tex);
     this.bindTex(3, (this.expo[this.expIdx] as Target).tex);
     this.bindTex(4, (this.expo[1 - this.expIdx] as Target).tex);
+    this.bindTex(5, this.motion?.tex);
+    this.bindTex(6, this.motion?.depthTex);
+    p.i('uBodyMotion', 5);
+    p.i('uBodyMotionDepth', 6);
     p.i('uCur', 0);
     p.i('uDepth', 1);
     p.i('uHist', 2);

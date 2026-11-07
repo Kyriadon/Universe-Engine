@@ -698,6 +698,10 @@ export const BODY_FRAG =
   `
 uniform vec3 uSpin;
 uniform float uRot;
+uniform float uMotionPass;
+uniform float uPrevBodyValid;
+uniform vec3 uPrevBodyCenterR;
+uniform float uPrevRotDelta;
 uniform vec4 uLight;     // xyz: unit direction to the star, w: flux at the body
 uniform float uLightT;
 uniform float uLightAng; // angular radius of the star as seen from the body
@@ -926,6 +930,38 @@ void main() {
   float ddy = dFdy(dt.y);
   gl_FragDepth = ldepth(max(hitS ? hs.x : ha.x, 0.0) * uRad);
   if (ha.y < 0.0 || (!hitS && uAtmH <= 0.0)) discard;
+
+  if (uMotionPass > 0.5) {
+    // Atmosphere-only pixels and independently animated surface effects must not reuse
+    // history. Static surface texels are mapped back to their previous world-space location.
+    if (!hitS || uPrevBodyValid < 0.5) {
+      oColor = vec4(0.0);
+      return;
+    }
+
+    vec3 axis = normalize(uSpin);
+    float a = -uPrevRotDelta;
+    float ca = cos(a);
+    float sa = sin(a);
+    vec3 nPrev = n * ca + cross(axis, n) * sa
+               + axis * dot(axis, n) * (1.0 - ca);
+
+    // Previous body centre relative to the previous camera, in body radii.
+    vec3 qPrev = uPrevBodyCenterR + nPrev - uPrevRel / uRad;
+    vec3 vPrev = vec3(
+      dot(qPrev, uPrevRight),
+      dot(qPrev, uPrevUp),
+      dot(qPrev, uPrevFwd)
+    );
+    if (vPrev.z <= 1e-4) {
+      oColor = vec4(0.0);
+      return;
+    }
+
+    vec2 prevNdc = vPrev.xy / (vPrev.z * uPrevTan);
+    oColor = vec4(prevNdc * 0.5 + 0.5, 0.0, 1.0);
+    return;
+  }
 
   vec3 surf = vec3(0.0);
   if (hitS) {
@@ -1685,6 +1721,8 @@ export const TAAU_FRAG =
   `
 uniform sampler2D uCur;
 uniform sampler2D uDepth;
+uniform sampler2D uBodyMotion;
+uniform sampler2D uBodyMotionDepth;
 uniform sampler2D uHist;
 uniform sampler2D uExpCur;
 uniform sampler2D uExpPrev;
@@ -1727,6 +1765,7 @@ void main() {
   vec3 mx = vec3(-1e9);
   float wsum = 0.0;
   float zMin = 1.0;
+  ivec2 nearestT = clamp(ip, ivec2(0), maxT);
   for (int j = -1; j <= 1; j++) {
     for (int i = -1; i <= 1; i++) {
       ivec2 t = clamp(ip + ivec2(i, j), ivec2(0), maxT);
@@ -1739,7 +1778,11 @@ void main() {
       m2 += s * s;
       mn = min(mn, s);
       mx = max(mx, s);
-      zMin = min(zMin, texelFetch(uDepth, t, 0).r);
+      float z = texelFetch(uDepth, t, 0).r;
+      if (z < zMin) {
+        zMin = z;
+        nearestT = t;
+      }
     }
   }
   vec3 cur = sum / wsum;
@@ -1753,10 +1796,25 @@ void main() {
   bool ok = false;
   vec2 ndc = vUv * 2.0 - 1.0;
   if (uReset < 0.5) {
-    vec3 rd = normalize(uCamFwd + ndc.x * uTanHalf.x * uCamRight + ndc.y * uTanHalf.y * uCamUp);
-    ok = prevNdc(rd, distOf(zMin), hp);
-    hp = hp * 0.5 + 0.5;
-    ok = ok && all(greaterThanEqual(hp, vec2(0.0))) && all(lessThanEqual(hp, vec2(1.0)));
+    vec4 bodyMotion = texelFetch(uBodyMotion, nearestT, 0);
+    float bodyMotionDepth = texelFetch(uBodyMotionDepth, nearestT, 0).r;
+    bool bodyPixel = bodyMotionDepth < 0.99999
+                  && abs(bodyMotionDepth - zMin) < 2e-6;
+
+    if (bodyPixel) {
+      // A body pixel with no valid motion (new body, atmosphere, or animated map effects)
+      // must reject history rather than fall back to camera-only reprojection.
+      if (bodyMotion.a > 0.5) {
+        hp = bodyMotion.xy;
+        ok = all(greaterThanEqual(hp, vec2(0.0)))
+          && all(lessThanEqual(hp, vec2(1.0)));
+      }
+    } else {
+      vec3 rd = normalize(uCamFwd + ndc.x * uTanHalf.x * uCamRight + ndc.y * uTanHalf.y * uCamUp);
+      ok = prevNdc(rd, distOf(zMin), hp);
+      hp = hp * 0.5 + 0.5;
+      ok = ok && all(greaterThanEqual(hp, vec2(0.0))) && all(lessThanEqual(hp, vec2(1.0)));
+    }
   }
   if (ok) {
     float rE = texelFetch(uExpCur, ivec2(0), 0).r / max(texelFetch(uExpPrev, ivec2(0), 0).r, 1e-30);
