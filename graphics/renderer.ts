@@ -352,7 +352,10 @@ const norm = (a: Vec3): Vec3 => {
 
 interface BodyFrameState {
   pos: WorldPos;
+  spin: Vec3;
   rot: number;
+  radius: number;
+  frame: number;
 }
 
 function copyWorldPos(pos: WorldPos): WorldPos {
@@ -852,7 +855,8 @@ export class Renderer {
           const body = im.o;
           this.setup(im, scene, cam, bodies);
 
-          const previous = this.bodyHistory.get(body);
+          const cached = this.bodyHistory.get(body);
+          const previous = cached?.frame === this.frame - 1 ? cached : undefined;
           let prevX = 0;
           let prevY = 0;
           let prevZ = 0;
@@ -867,7 +871,9 @@ export class Renderer {
           // surface-space motion; reject their history rather than reprojecting it incorrectly.
           const animatedSurface = (body.flow ?? 0) > 0 || (body.storm ?? 0) > 0;
           P.body.f('uPrevBodyCenterR', prevX, prevY, prevZ);
-          P.body.f('uPrevRotDelta', previous ? body.rot - previous.rot : 0);
+          P.body.v('uPrevSpin', previous?.spin ?? body.spin);
+          P.body.f('uPrevRot', previous?.rot ?? body.rot);
+          P.body.f('uPrevRadiusRatio', previous ? previous.radius / body.radius : 1);
           P.body.f('uPrevBodyValid', previous && !animatedSurface ? 1 : 0);
           P.body.f('uMotionPass', 1);
           gl.depthMask(true);
@@ -881,7 +887,13 @@ export class Renderer {
 
     // Snapshot body transforms after the motion pass so next frame has the exact previous state.
     for (const body of bodies) {
-      this.bodyHistory.set(body, { pos: copyWorldPos(body.pos), rot: body.rot });
+      this.bodyHistory.set(body, {
+        pos: copyWorldPos(body.pos),
+        spin: [body.spin[0], body.spin[1], body.spin[2]],
+        rot: body.rot,
+        radius: body.radius,
+        frame: this.frame,
+      });
     }
 
     // remember this frame's camera for the next frame's reprojection

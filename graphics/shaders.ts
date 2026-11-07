@@ -701,7 +701,9 @@ uniform float uRot;
 uniform float uMotionPass;
 uniform float uPrevBodyValid;
 uniform vec3 uPrevBodyCenterR;
-uniform float uPrevRotDelta;
+uniform vec3 uPrevSpin;
+uniform float uPrevRot;
+uniform float uPrevRadiusRatio;
 uniform vec4 uLight;     // xyz: unit direction to the star, w: flux at the body
 uniform float uLightT;
 uniform float uLightAng; // angular radius of the star as seen from the body
@@ -939,15 +941,27 @@ void main() {
       return;
     }
 
-    vec3 axis = normalize(uSpin);
-    float a = -uPrevRotDelta;
-    float ca = cos(a);
-    float sa = sin(a);
-    vec3 nPrev = n * ca + cross(axis, n) * sa
-               + axis * dot(axis, n) * (1.0 - ca);
+    // Preserve the exact body-fixed longitude/latitude from bodyUv(), even if the
+    // spin axis itself changed between frames.
+    vec3 axisNow = normalize(uSpin);
+    vec3 uNow = normalize(cross(axisNow, abs(axisNow.y) < 0.99
+      ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0)));
+    vec3 vNow = cross(axisNow, uNow);
+    vec3 qNow = vec3(dot(n, uNow), dot(n, axisNow), dot(n, vNow));
+    float bodyLongitude = atan(qNow.z, qNow.x) - uRot;
+    float bodyCosLat = length(qNow.xz);
 
-    // Previous body centre relative to the previous camera, in body radii.
-    vec3 qPrev = uPrevBodyCenterR + nPrev - uPrevRel / uRad;
+    vec3 axisPrev = normalize(uPrevSpin);
+    vec3 uPrev = normalize(cross(axisPrev, abs(axisPrev.y) < 0.99
+      ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0)));
+    vec3 vPrev = cross(axisPrev, uPrev);
+    float previousLongitude = bodyLongitude + uPrevRot;
+    vec3 nPrev = uPrev * (cos(previousLongitude) * bodyCosLat)
+               + axisPrev * qNow.y
+               + vPrev * (sin(previousLongitude) * bodyCosLat);
+
+    // Previous body centre relative to the previous camera, in current body radii.
+    vec3 qPrev = uPrevBodyCenterR + nPrev * uPrevRadiusRatio - uPrevRel / uRad;
     vec3 vPrev = vec3(
       dot(qPrev, uPrevRight),
       dot(qPrev, uPrevUp),
