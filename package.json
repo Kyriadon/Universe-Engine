@@ -1,0 +1,20 @@
+{
+  "name": "universe-engine",
+  "version": "1.0.0",
+  "description": "General package resources",
+  "homepage": "https://github.com/Kyriadon/Universe-Engine#readme",
+  "bugs": {
+    "url": "https://github.com/Kyriadon/Universe-Engine/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Kyriadon/Universe-Engine.git"
+  },
+  "license": "MIT",
+  "author": "Kyriadon",
+  "type": "module",
+  "main": "index.html",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  }
+}
