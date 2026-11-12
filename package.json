@@ -13,8 +13,14 @@
   "license": "MIT",
   "author": "Kyriadon",
   "type": "module",
-  "main": "index.html",
   "scripts": {
+    "dev": "vite --open /packages/core/src/index.html",
+    "milkyway": "vite-node scripts/milkyway.ts",
     "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2",
+    "vite": "^8.3.8",
+    "vite-node": "^6.0.0"
   }
 }
