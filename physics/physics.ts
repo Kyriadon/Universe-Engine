@@ -25,7 +25,10 @@ import { iscoRadiusRg } from '../graphics/shaders';
 const TAU = Math.PI * 2;
 /** Shear is bounded by cross-fading two phases of this length (R_g/c): keeps structure resolvable in the texture. */
 const FLOW_CYCLE = 50;
-const HOTSPOTS = 6;
+/** Small, short-lived magnetic-reconnection flares, sized to resolve at 256 texels (sigma >= 2 texels). */
+const HOTSPOTS = 24;
+/** A new build may start at most this often in real time, so a fast simulation never keeps the CPU busy. */
+const MIN_REBUILD_MS = 400;
 const ARMS = 2;
 /** The shader orbits the texture between builds, so a new build is only needed for the slow evolution: every this many R_g / c. */
 const REBUILD_STEP_RG = 3;
@@ -140,6 +143,7 @@ export class PlasmaDisk {
   private shownTimeRg: number;
   private job: BuildJob | null = null;
   private isReady = false;
+  private lastBuildMs = 0;
   private dirty = false;
 
   private texture: WebGLTexture | null = null;
@@ -188,7 +192,13 @@ export class PlasmaDisk {
   step(dtSeconds: number, rgSeconds: number): void {
     if (!(dtSeconds > 0)) return;
     this.timeRg += dtSeconds / Math.max(rgSeconds, 1e-9);
-    if (this.job === null && Math.abs(this.timeRg - this.builtTimeRg) >= REBUILD_STEP_RG) this.beginBuild();
+    if (
+      this.job === null &&
+      Math.abs(this.timeRg - this.builtTimeRg) >= REBUILD_STEP_RG &&
+      performance.now() - this.lastBuildMs >= MIN_REBUILD_MS
+    ) {
+      this.beginBuild();
+    }
   }
 
   /**
@@ -231,18 +241,18 @@ export class PlasmaDisk {
 
     const spots: HotSpot[] = [];
     for (let k = 0; k < HOTSPOTS; k++) {
-      const life = 350 + 300 * hash(k, 7, 3, seed);
+      const life = 80 + 120 * hash(k, 7, 3, seed);
       const shifted = t + k * 97.3;
       const epoch = Math.floor(shifted / life);
       const age = (shifted - epoch * life) / life;
-      const lnR = this.lnIn + this.lnSpan * (0.04 + 0.5 * hash(k, epoch, 1, seed));
+      const lnR = this.lnIn + this.lnSpan * (0.03 + 0.55 * hash(k, epoch, 1, seed));
       const env = Math.sin(Math.PI * age);
       spots.push({
         lnR,
         phi: TAU * hash(k, epoch, 2, seed) + this.omega(Math.exp(lnR)) * t,
-        sigmaLnR: 0.05 + 0.03 * hash(k, epoch, 4, seed),
-        sigmaPhi: 0.12 + 0.35 * age,
-        amp: 3 * env * env * (0.6 + 0.8 * hash(k, epoch, 5, seed)),
+        sigmaLnR: 0.016 + 0.012 * hash(k, epoch, 4, seed),
+        sigmaPhi: 0.05 + 0.3 * age,
+        amp: 3.5 * env * env * (0.5 + 0.9 * hash(k, epoch, 5, seed)),
       });
     }
 
@@ -293,6 +303,7 @@ export class PlasmaDisk {
       let flare = 0;
       for (const s of job.spots) {
         const dr = (lnR - s.lnR) / s.sigmaLnR;
+        if (s.amp <= 0 || dr * dr > 16) continue;
         const dp = wrapPi(phi - s.phi) / s.sigmaPhi;
         flare += s.amp * Math.exp(-0.5 * (dr * dr + dp * dp));
       }
@@ -336,6 +347,7 @@ export class PlasmaDisk {
     this.shownTimeRg = job.t;
     this.isReady = true;
     this.dirty = true;
+    this.lastBuildMs = performance.now();
   }
 
   private buildMips(levels: Float32Array[]): void {
