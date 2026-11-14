@@ -114,8 +114,9 @@ export interface RendererSettings {
    * samples: integer 1..8 supersamples per pixel (uSamples).
    * maxFootprintPx: largest lensed-background footprint in pixels before it is mip-filtered
    *   (uMaxFootprint); 0 switches the mip chain off.
-   * temporalBlend: 0..0.95 weight of the previous frame (uTemporalBlend), 0 = off. Only used while
-   *   the camera is not translating; the pass then also jitters by a sub-pixel offset (uJitter).
+   * temporalBlend: 0..0.95 weight of the previous frame (uTemporalBlend) while the camera moves, 0 = off.
+   *   It fades out smoothly with camera translation, and rises towards 0.9 (less at high simulation
+   *   speed) while the camera is still, so the sub-pixel jitter (uJitter) converges instead of shimmering.
    * plasmaMix: 0..1, 0 = flat procedural disk, 1 = full PlasmaDisk texture (uPlasmaMix).
    * plasmaSize: PlasmaDisk texels per side (the CPU cost of one rebuild grows with its square).
    * plasmaUpdateHz: most PlasmaDisk rebuilds per real second.
@@ -848,6 +849,8 @@ interface BlackHoleHistory {
   valid: boolean;
   body: BlackHoleBody | null;
   settingsRev: number;
+  /** Consecutive frames the camera has been still (drives the blend boost). */
+  still: number;
   /** Camera-relative centre of the hole in the frame that wrote the target. */
   x: number;
   y: number;
@@ -943,6 +946,7 @@ export function createRenderer(options: RendererOptions = {}): Renderer {
     valid: false,
     body: null,
     settingsRev: -1,
+    still: 0,
     x: 0,
     y: 0,
     z: 0,
@@ -1832,7 +1836,8 @@ export function createRenderer(options: RendererOptions = {}): Renderer {
         innerRg,
         width: bh.plasmaSize,
         height: bh.plasmaSize,
-        updateHz: bh.plasmaUpdateHz,
+        // This function throttles the rebuilds itself, so PlasmaDisk's own limiter must never skip one.
+        updateHz: 1000,
       });
       plasma.setTime(fc.simTime / rgSeconds);
       e = {
@@ -1855,9 +1860,12 @@ export function createRenderer(options: RendererOptions = {}): Renderer {
     e.lastSim = fc.simTime;
     e.pendingReal += fc.dt;
     e.lastUsedFrame = frameIndex;
-    // The CPU rebuild is expensive: hand time to the plasma at most plasmaUpdateHz times per real second,
-    // and only when simulation time actually advanced (never while paused).
-    if (e.pendingSim > 0 && e.pendingReal >= 1 / e.updateHz) {
+    // The CPU rebuild is expensive (a frame hitch), so it runs only when it can show: at most plasmaUpdateHz
+    // times per real second, and only once the fastest orbit (the inner edge) has moved half a texel in
+    // azimuth. Smaller steps are invisible, and the texture is time-exact again at the next rebuild.
+    const omegaMax = 1 / (Math.pow(e.plasma.rIn, 1.5) + e.spin);
+    const minStepSim = (PI / e.size / omegaMax) * rgSeconds;
+    if (e.pendingSim >= minStepSim && e.pendingReal >= 1 / e.updateHz) {
       e.plasma.step(e.pendingSim, rgSeconds);
       e.pendingSim = 0;
       e.pendingReal = 0;
@@ -1886,14 +1894,25 @@ export function createRenderer(options: RendererOptions = {}): Renderer {
   }
 
   /**
-   * The previous output may be blended in only for the same hole, the same settings and a camera that
-   * moved less than half a pixel of parallax (the shader reprojects rotation only).
+   * 0..1 trust in the previous output. 0 for another hole, other settings or no history; otherwise it falls
+   * smoothly from 1 (camera has not translated) to 0 (half a pixel of parallax), because the shader only
+   * reprojects rotation. A smooth value means the blend and the jitter fade instead of switching on and off.
    */
-  function historyUsable(b: BlackHoleBody, it: Item): boolean {
+  function historyConfidence(b: BlackHoleBody, it: Item): number {
     const h = bhState;
-    if (!h.valid || h.body !== b || h.settingsRev !== settingsRevision) return false;
-    const pxAng = (2 * fc.tanY) / fc.height;
-    return Math.hypot(it.x - h.x, it.y - h.y, it.z - h.z) <= 0.5 * pxAng * it.dist;
+    if (!h.valid || h.body !== b || h.settingsRev !== settingsRevision) return 0;
+    const limit = 0.5 * ((2 * fc.tanY) / fc.height) * it.dist;
+    if (!(limit > 0)) return 0;
+    const s = clamp(1 - Math.hypot(it.x - h.x, it.y - h.y, it.z - h.z) / limit, 0, 1);
+    return s * s * (3 - 2 * s);
+  }
+
+  /** True when the camera has turned by less than a twentieth of a pixel since the history was written. */
+  function cameraStill(): boolean {
+    const h = bhState;
+    const df = clamp(fc.forward[0] * h.fx + fc.forward[1] * h.fy + fc.forward[2] * h.fz, -1, 1);
+    const dr = clamp(fc.right[0] * h.rx + fc.right[1] * h.ry + fc.right[2] * h.rz, -1, 1);
+    return Math.max(Math.acos(df), Math.acos(dr)) <= 0.05 * ((2 * fc.tanY) / fc.height);
   }
 
   function drawBlackHole(b: BlackHoleBody, it: Item): void {
@@ -1917,7 +1936,13 @@ export function createRenderer(options: RendererOptions = {}): Renderer {
     bhDrawn += 1;
     const plasma = disk !== null && bh.plasmaMix > 0 ? plasmaFor(b, disk, outerRg) : null;
     const hist = first && bh.temporalBlend > 0 ? ensureHistory(t) : null;
-    const histOk = hist !== null && historyUsable(b, it);
+    const conf = hist === null ? 0 : historyConfidence(b, it);
+    if (first) bhState.still = conf > 0.95 && cameraStill() ? bhState.still + 1 : 0;
+    // While the camera is still the blend rises towards 0.9 so the jittered samples average out (no edge
+    // shimmer); it falls back to temporalBlend as soon as the camera moves, and a faster simulation (a
+    // faster-moving disk) lowers the ceiling so nothing ghosts.
+    const accum = Math.min(1 - 1 / (bhState.still + 1), 0.9 / Math.max(1, Math.abs(fc.simSpeed)));
+    const blend = conf * Math.max(bh.temporalBlend, accum);
     const mip = bh.maxFootprintPx > 0;
 
     const meta = SHADERS.blackhole;
@@ -1965,14 +1990,14 @@ export function createRenderer(options: RendererOptions = {}): Renderer {
     f1(p, 'uJetLengthRg', jet === null ? 0 : jet.lengthRg);
     f1(p, 'uJetWidth', jet === null ? 0 : jet.widthRg);
 
-    // Supersampling, mip-filtered lensing and temporal smoothing. The sub-pixel jitter only runs while the
-    // history is in use, otherwise it would just shimmer.
+    // Supersampling, mip-filtered lensing and temporal smoothing. The sub-pixel jitter scales with the
+    // history confidence: it is full while the history is trusted and gone when it is not (it would shimmer).
     const jn = (frameIndex % 16) + 1;
     i1(p, 'uSamples', bh.samples);
-    f2(p, 'uJitter', histOk ? halton(jn, 2) - 0.5 : 0, histOk ? halton(jn, 3) - 0.5 : 0);
+    f2(p, 'uJitter', (halton(jn, 2) - 0.5) * conf, (halton(jn, 3) - 0.5) * conf);
     f1(p, 'uMaxFootprint', bh.maxFootprintPx);
-    f1(p, 'uTemporalBlend', hist === null ? 0 : bh.temporalBlend);
-    f1(p, 'uHistoryValid', histOk ? 1 : 0);
+    f1(p, 'uTemporalBlend', blend);
+    f1(p, 'uHistoryValid', conf > 0 ? 1 : 0);
     f3(p, 'uPrevCamRight', bhState.rx, bhState.ry, bhState.rz);
     f3(p, 'uPrevCamUp', bhState.ux, bhState.uy, bhState.uz);
     f3(p, 'uPrevCamForward', bhState.fx, bhState.fy, bhState.fz);
@@ -1991,7 +2016,7 @@ export function createRenderer(options: RendererOptions = {}): Renderer {
     }
     i1(p, 'uPlasma', PLASMA_UNIT);
 
-    bindTex(HISTORY_UNIT, hist !== null && histOk ? hist.tex : blackTex);
+    bindTex(HISTORY_UNIT, hist !== null && conf > 0 ? hist.tex : blackTex);
     i1(p, 'uHistory', HISTORY_UNIT);
 
     bindTex(SCENE_UNIT, src.tex);
