@@ -361,6 +361,7 @@ void main() {
 //    rotation-reprojected, colour-clamped). Set uHistoryValid = 0 after a camera teleport / large move.
 // Disk = thin opaque surface found at the equatorial-plane crossings (primary + lensed secondary images).
 // uDiskOpacity is optical depth per crossing / 20 (internally at least 3), uDiskHeight is unused.
+// uDiskVisTemp (K, default 12000): hottest displayed colour; keeps the disk glowing instead of washing to blue-white.
 // PLASMA: optional uPlasma texture from physics.ts (see PLASMA contract at the top); uPlasmaMix = 0 -> flat procedural disk.
 // Uniforms: uCenter (m), uRg (GM/c^2, m), uSpinAxis, uSpin (0..0.998), uKerr, uBoundRg (auto-raised to enclose the disk), uDiskInnerRg (<=0 -> ISCO),
 // uDiskOuterRg, uDiskHeight (H/r), uDiskTemperature (peak K), uDiskOpacity, uDiskGain, uSurfaceRg,
@@ -380,6 +381,7 @@ uniform float uDiskHeight;
 uniform float uDiskTemperature;
 uniform float uDiskOpacity;
 uniform float uDiskGain;
+uniform float uDiskVisTemp;
 uniform float uSurfaceRg;
 uniform float uSurfaceTemperature;
 uniform int uMaxSteps;
@@ -581,13 +583,21 @@ vec3 trace(vec2 fc) {
           float wv = 0.03 * pow(rc2 / 10.0, -0.5);
           float n0 = fbm(vec3(rot2(hp.xy, wv * 100.0 * ph) * 0.35, 0.0), 3);
           float n1 = fbm(vec3(rot2(hp.xy, wv * 100.0 * (ph - 1.0)) * 0.35, 0.0), 3);
-          float bands = 0.75 + 0.5 * noise3(vec3(log(rc2) * 22.0, 3.7, 0.0));
-          float tex = bands * (0.65 + 0.7 * mix(n0, n1, ph));
+          float lr = log(rc2);
+          float bands = 0.6 + 0.8 * noise3(vec3(lr * 22.0, 3.7, 0.0));
+          float fineBands = 0.8 + 0.4 * noise3(vec3(lr * 90.0, 1.3, 0.0));
+          float tex = bands * (0.6 + 0.8 * mix(n0, n1, ph));
+          tex *= mix(1.0, fineBands, 1.0 - smoothstep(0.3, 1.0, length(hp - ro) * pxAng / (0.011 * rc2)));
           tex = mix(1.0, tex, 1.0 - smoothstep(0.3, 1.0, pxSize / (0.05 * rc2)));
           tex = mix(tex, pl.r, uPlasmaMix);
-          float edge = (1.0 - smoothstep(0.78 * rOut, rOut, rc2)) * smoothstep(rIn, rIn * 1.04, rc2);
-          vec3 S = blackbodyColor(To) * blackbodyRadiance(To) * uDiskGain * tex;
-          S += blackbodyColor(To * 1.25) * blackbodyRadiance(To) * uDiskGain * pl.b;
+          float edge = (1.0 - smoothstep(0.9 * rOut, rOut, rc2)) * smoothstep(rIn, rIn * 1.04, rc2);
+          // Display colour: hot white-yellow core cooling to orange/red; intensity keeps the physical T^4 falloff.
+          float ratio = To / max(uDiskTemperature, 1.0);
+          float tmax = uDiskVisTemp > 0.0 ? uDiskVisTemp : 12000.0;
+          float Tcol = 1700.0 + (tmax - 1700.0) * pow(clamp(ratio, 0.0, 1.8) / 1.8, 0.75);
+          float I4 = ratio * ratio * ratio * ratio;
+          vec3 S = blackbodyColor(Tcol) * blackbodyRadiance(uDiskTemperature) * I4 * uDiskGain * tex;
+          S += blackbodyColor(Tcol * 1.2) * blackbodyRadiance(uDiskTemperature) * I4 * uDiskGain * pl.b;
           float al = edge * (1.0 - exp(-max(uDiskOpacity * 20.0, 3.0))) * clamp(0.45 + 0.55 * pl.r, 0.0, 1.0);
           acc += trans * S * al;
           trans *= 1.0 - al;
