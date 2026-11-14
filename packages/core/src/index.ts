@@ -1,5 +1,6 @@
-import { translate } from './coords';
+import { translate, type Vec3 } from './coords';
 import { createGL } from '../../../graphics/gl';
+import { Gravity, blackHoleSource } from '../../../physics/physics';
 import {
   createRenderer,
   type BlackHoleBody,
@@ -30,6 +31,14 @@ function isBlackHole(member: MilkyWayMember): member is BlackHole {
   );
 }
 
+// The data has no spin axis yet, so the axis is derived from the angle the spawn view makes with the pole: 84 degrees is
+// almost edge-on, a little above the disk plane, which gives the classic photon-ring look (camera on +Z, axis tilted in Y-Z).
+const VIEW_ANGLE_FROM_POLE_RAD = (84 * Math.PI) / 180;
+const SPIN_AXIS: Vec3 = [0, Math.sin(VIEW_ANGLE_FROM_POLE_RAD), Math.cos(VIEW_ANGLE_FROM_POLE_RAD)];
+
+// The disk is cut at this radius (R_g) so it stays thin and sharp at the spawn distance.
+const DISK_OUTER_RG = 16;
+
 /** Convert black-hole information into renderer input. */
 function toBlackHoleBody(bh: BlackHole): BlackHoleBody {
   const base = {
@@ -40,17 +49,14 @@ function toBlackHoleBody(bh: BlackHole): BlackHoleBody {
 
   const flow = bh.regions.find((r) => r.id === 'accretion-flow');
 
-  // The data has no spin axis yet: tilt it so the spawn view is ~84 degrees from the pole (almost edge-on, a
-  // little above the disk plane), which gives the classic photon-ring look. The disk is cut at 16 R_g so it
-  // stays thin and sharp at the spawn distance.
-  const oriented = { ...base, spinAxis: [0, 0.9945, 0.1045] as const };
+  const oriented = { ...base, spinAxis: SPIN_AXIS };
 
   return flow?.temperatureK
     ? {
         ...oriented,
         disk: {
           peakTemperatureK: flow.temperatureK.inner,
-          outerRg: 16,
+          outerRg: DISK_OUTER_RG,
         },
       }
     : oriented;
@@ -87,6 +93,16 @@ const cameraStart = translate(
 );
 
 // ---------------------------------------------------------------------------
+// GRAVITY
+// ---------------------------------------------------------------------------
+
+// Every black hole in the scene pulls on everything, including the camera (physics/physics.ts). GM comes from each
+// black hole's own gravitational radius, so a second black hole in the data pulls too with no edit here.
+const gravity = new Gravity(
+  (scene.blackHoles ?? []).map((b) => blackHoleSource(b.position, b.rgM)),
+);
+
+// ---------------------------------------------------------------------------
 // RENDERER
 // ---------------------------------------------------------------------------
 
@@ -97,6 +113,7 @@ const handle = createGL(
   {
     camera: cameraStart,
     initialSpeed: 1e6,
+    gravity,
     onContextRestored: (gl) => renderer.restore(gl),
   },
 );
