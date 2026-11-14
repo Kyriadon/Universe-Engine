@@ -21,6 +21,9 @@
  *   shaders.ts   SHADERS (sources and blend/depth/readsScene metadata) and ATTRIBUTES. The
  *                metadata drives GL state: blend from `blend`, depth test+write from
  *                `writesDepth`, the ping-pong path from `readsScene`.
+ *   physics.ts   PlasmaDisk: the accretion-disk plasma texture the blackhole shader samples
+ *                (uPlasma, uPlasmaMix, uPlasmaSize). One PlasmaDisk per black hole that has a
+ *                disk, created on first draw, advanced by simulation time, uploaded on unit 2.
  *
  * Draw order (shaders.ts header)
  *   background, cosmicWeb, galaxies, nebulae, stars, pulsars, then black holes and planet
@@ -32,6 +35,10 @@
  *   The blackhole program reads uSceneColor and writes a full frame. It reads scene[cur] and
  *   writes scene[1 - cur]; the two never alias (asserted before every sampling draw), the
  *   depth buffer is a renderbuffer shared by both framebuffers, and unit 0 is unbound after.
+ *   For the pass uSceneColor (unit 0) gets a mip chain (generateMipmap, then plain LINEAR again),
+ *   uHistory (unit 1) is a private copy of this pass's previous output (only the first black
+ *   hole of a frame uses it, and only while the camera has not translated), and the plasma
+ *   texture is on unit 2. All three units are unbound after the pass.
  *
  * Exposure
  *   Every scene pass multiplies by uExposure (pre-exposure, settings.exposure). Artistic gains
@@ -48,6 +55,7 @@
 import { CELL_SIZE_M, Tier, deltaInto, type Vec3, type WorldPos } from '../packages/core/src/coords';
 import type { FrameInfo } from './gl';
 import { ATTRIBUTES, SHADERS, type ShaderName, type ShaderSource } from './shaders';
+import { PlasmaDisk } from '../physics/physics';
 
 // ---------------------------------------------------------------------------
 // Public types: settings
@@ -100,8 +108,28 @@ export interface RendererSettings {
     level: number;
   };
   stars: { psfSigmaPx: number; pointSizeMax: number; spikeStrength: number; maxPerField: number };
-  /** peakLevel: display-referred brightness of the hottest disk pixel when a disk has no gain. */
-  blackHole: { peakLevel: number };
+  /**
+   * peakLevel: display-referred brightness of the hottest disk pixel when a disk has no gain.
+   * kerr: Kerr null geodesics (uKerr = 1) instead of the fast Schwarzschild bending (uKerr = 0).
+   * samples: integer 1..8 supersamples per pixel (uSamples).
+   * maxFootprintPx: largest lensed-background footprint in pixels before it is mip-filtered
+   *   (uMaxFootprint); 0 switches the mip chain off.
+   * temporalBlend: 0..0.95 weight of the previous frame (uTemporalBlend), 0 = off. Only used while
+   *   the camera is not translating; the pass then also jitters by a sub-pixel offset (uJitter).
+   * plasmaMix: 0..1, 0 = flat procedural disk, 1 = full PlasmaDisk texture (uPlasmaMix).
+   * plasmaSize: PlasmaDisk texels per side (the CPU cost of one rebuild grows with its square).
+   * plasmaUpdateHz: most PlasmaDisk rebuilds per real second.
+   */
+  blackHole: {
+    peakLevel: number;
+    kerr: boolean;
+    samples: number;
+    maxFootprintPx: number;
+    temporalBlend: number;
+    plasmaMix: number;
+    plasmaSize: number;
+    plasmaUpdateHz: number;
+  };
   bloom: { strength: number; radius: number; weight: number; levels: number };
   /** Base raymarch steps at 'medium' quality and full work; clamped to each shader's maximum. */
   steps: {
@@ -167,6 +195,18 @@ export interface BlackHoleDisk {
   readonly opacity?: number;
   /** uDiskGain as given; omit to normalise the peak to settings.blackHole.peakLevel. */
   readonly gain?: number;
+  /** uDiskVisTemp: hottest displayed colour in K. Omit for BLACK_HOLE_DEFAULTS.visTempK. */
+  readonly visTempK?: number;
+}
+
+/** Bipolar relativistic jets along the spin axis (uJetGain, uJetLengthRg, uJetWidth). */
+export interface BlackHoleJet {
+  /** Display-referred brightness; the renderer divides by exposure. 0 or less: no jets. */
+  readonly gain: number;
+  /** Jet length in Rg. */
+  readonly lengthRg: number;
+  /** Jet width at the base in Rg. */
+  readonly widthRg: number;
 }
 
 /** A solid surface instead of a horizon: neutron star (radiusRg > 2) or gravastar. */
@@ -186,6 +226,8 @@ export interface BlackHoleBody {
   readonly boundRg?: number;
   /** Omitted or null: no accretion disk. */
   readonly disk?: BlackHoleDisk | null;
+  /** Omitted or null: no jets. */
+  readonly jet?: BlackHoleJet | null;
   readonly surface?: CompactSurface;
 }
 
@@ -404,6 +446,12 @@ const WORK_MIN = 0.35;
 const RES_FLOOR = 0.8001;
 const SCISSOR_PAD = 2;
 const STAR_EVICT_FRAMES = 300;
+const PLASMA_EVICT_FRAMES = 300;
+const C_LIGHT = 299792458;
+/** Texture units of the blackhole pass. */
+const SCENE_UNIT = 0;
+const HISTORY_UNIT = 1;
+const PLASMA_UNIT = 2;
 
 const ZERO3: Vec3 = [0, 0, 0];
 const AXIS_Y: Vec3 = [0, 1, 0];
@@ -416,6 +464,8 @@ const BLACK_HOLE_DEFAULTS = {
   opacity: 1.5,
   boundMinRg: 40,
   boundOverOuter: 1.25,
+  /** The shader's own default for uDiskVisTemp. */
+  visTempK: 12000,
 } as const;
 
 const QUALITY: Readonly<Record<QualityPreset, { readonly stepScale: number; readonly bloomLevels: number }>> = {
@@ -462,7 +512,16 @@ export const DEFAULT_RENDERER_SETTINGS: Readonly<RendererSettings> = {
     level: 0.05,
   },
   stars: { psfSigmaPx: 0.9, pointSizeMax: 64, spikeStrength: 1, maxPerField: 1 << 20 },
-  blackHole: { peakLevel: 4 },
+  blackHole: {
+    peakLevel: 4,
+    kerr: true,
+    samples: 1,
+    maxFootprintPx: 16,
+    temporalBlend: 0.6,
+    plasmaMix: 1,
+    plasmaSize: 128,
+    plasmaUpdateHz: 2,
+  },
   bloom: { strength: 0.06, radius: 1, weight: 0.65, levels: 6 },
   steps: { galaxy: 48, nebula: 64, clouds: 48, pulsar: 48, cosmicWeb: 32, blackHole: 256 },
 };
@@ -505,6 +564,23 @@ function validateSettings(s: RendererSettings): void {
   if (!(s.stars.maxPerField >= 0)) bad('stars.maxPerField must be >= 0');
   if (!(s.maxFlashHz > 0)) bad('maxFlashHz must be positive');
   if (!(s.blackHole.peakLevel > 0)) bad('blackHole.peakLevel must be positive');
+  if (typeof s.blackHole.kerr !== 'boolean') bad('blackHole.kerr must be a boolean');
+  if (!Number.isInteger(s.blackHole.samples) || s.blackHole.samples < 1 || s.blackHole.samples > 8) {
+    bad('blackHole.samples must be an integer from 1 to 8');
+  }
+  if (!(s.blackHole.maxFootprintPx >= 0 && Number.isFinite(s.blackHole.maxFootprintPx))) {
+    bad('blackHole.maxFootprintPx must be >= 0');
+  }
+  if (!(s.blackHole.temporalBlend >= 0 && s.blackHole.temporalBlend <= 0.95)) {
+    bad('blackHole.temporalBlend must be between 0 and 0.95');
+  }
+  if (!(s.blackHole.plasmaMix >= 0 && s.blackHole.plasmaMix <= 1)) bad('blackHole.plasmaMix must be between 0 and 1');
+  if (!Number.isInteger(s.blackHole.plasmaSize) || s.blackHole.plasmaSize < 8) {
+    bad('blackHole.plasmaSize must be an integer >= 8');
+  }
+  if (!(s.blackHole.plasmaUpdateHz > 0 && Number.isFinite(s.blackHole.plasmaUpdateHz))) {
+    bad('blackHole.plasmaUpdateHz must be positive');
+  }
   if (!Number.isInteger(s.bloom.levels) || s.bloom.levels < 0) bad('bloom.levels must be a non-negative integer');
 }
 
@@ -517,6 +593,19 @@ function nextPow2(n: number): number {
   let p = 1;
   while (p < n) p *= 2;
   return p;
+}
+
+/** Halton sequence value in [0, 1) for index i >= 1 (sub-pixel jitter). */
+function halton(i: number, base: number): number {
+  let f = 1;
+  let r = 0;
+  let n = i;
+  while (n > 0) {
+    f /= base;
+    r += f * (n % base);
+    n = Math.floor(n / base);
+  }
+  return r;
 }
 
 interface Rect {
@@ -715,6 +804,8 @@ interface FrameConsts {
   width: number;
   height: number;
   time: number;
+  /** Real seconds since the previous frame. */
+  dt: number;
   simTime: number;
   simSpeed: number;
   paused: boolean;
@@ -733,6 +824,45 @@ interface Item {
   z: number;
   /** Near list only: 0 black hole, 1 planet. */
   kind: number;
+}
+
+/** One PlasmaDisk per black hole, with the settings it was built for and its update throttle. */
+interface PlasmaEntry {
+  readonly plasma: PlasmaDisk;
+  readonly spin: number;
+  readonly outerRg: number;
+  readonly innerRg: number;
+  readonly size: number;
+  readonly updateHz: number;
+  /** Simulation seconds at the previous draw. */
+  lastSim: number;
+  /** Simulation and real seconds not yet handed to PlasmaDisk.step. */
+  pendingSim: number;
+  pendingReal: number;
+  lastUsedFrame: number;
+}
+
+/** The blackhole pass's previous output and what it was drawn with (for uHistory). */
+interface BlackHoleHistory {
+  target: ColorTarget | null;
+  valid: boolean;
+  body: BlackHoleBody | null;
+  settingsRev: number;
+  /** Camera-relative centre of the hole in the frame that wrote the target. */
+  x: number;
+  y: number;
+  z: number;
+  rx: number;
+  ry: number;
+  rz: number;
+  ux: number;
+  uy: number;
+  uz: number;
+  fx: number;
+  fy: number;
+  fz: number;
+  tanX: number;
+  tanY: number;
 }
 
 const PROGRAMS_OF: Readonly<Record<ScenePass, readonly ShaderName[]>> = {
@@ -806,6 +936,30 @@ export function createRenderer(options: RendererOptions = {}): Renderer {
   let lastBloom: ColorTarget | null = null;
   let cmbDrawn = false;
 
+  // Black holes: plasma textures, previous-output history, count drawn this frame.
+  const plasmaCache = new Map<BlackHoleBody, PlasmaEntry>();
+  const bhState: BlackHoleHistory = {
+    target: null,
+    valid: false,
+    body: null,
+    settingsRev: -1,
+    x: 0,
+    y: 0,
+    z: 0,
+    rx: 1,
+    ry: 0,
+    rz: 0,
+    ux: 0,
+    uy: 1,
+    uz: 0,
+    fx: 0,
+    fy: 0,
+    fz: -1,
+    tanX: 1,
+    tanY: 1,
+  };
+  let bhDrawn = 0;
+
   // Per-frame scratch (no per-frame allocation in the hot paths).
   const rel64 = new Float64Array(3);
   const sunDir = new Float64Array(3);
@@ -828,6 +982,7 @@ export function createRenderer(options: RendererOptions = {}): Renderer {
     width: 1,
     height: 1,
     time: 0,
+    dt: 0,
     simTime: 0,
     simSpeed: 1,
     paused: false,
@@ -882,12 +1037,15 @@ export function createRenderer(options: RendererOptions = {}): Renderer {
     stVao = vao;
   }
 
+  function selectUnit(unit: number): void {
+    if (stActiveUnit === unit) return;
+    gl.activeTexture(gl.TEXTURE0 + unit);
+    stActiveUnit = unit;
+  }
+
   function bindTex(unit: number, tex: WebGLTexture | null): void {
     if (stTex[unit] === tex) return;
-    if (stActiveUnit !== unit) {
-      gl.activeTexture(gl.TEXTURE0 + unit);
-      stActiveUnit = unit;
-    }
+    selectUnit(unit);
     gl.bindTexture(gl.TEXTURE_2D, tex);
     stTex[unit] = tex;
   }
@@ -966,6 +1124,10 @@ export function createRenderer(options: RendererOptions = {}): Renderer {
     blackTex = null;
     tgt = null;
     starCache.clear();
+    plasmaCache.clear();
+    bhState.target = null;
+    bhState.valid = false;
+    bhState.body = null;
     lastBloom = null;
     keyValid = false;
     lastScene = null;
@@ -1158,7 +1320,13 @@ export function createRenderer(options: RendererOptions = {}): Renderer {
     [0x8d56, 'FRAMEBUFFER_INCOMPLETE_MULTISAMPLE'],
   ];
 
-  function createColorTarget(label: string, width: number, height: number, depth: WebGLRenderbuffer | null): ColorTarget {
+  function createColorTarget(
+    label: string,
+    width: number,
+    height: number,
+    depth: WebGLRenderbuffer | null,
+    mips = false,
+  ): ColorTarget {
     if (width > maxTextureSize || height > maxTextureSize) {
       throw new RendererError(`renderer.ts: ${label} (${width}x${height}) exceeds MAX_TEXTURE_SIZE ${maxTextureSize}`);
     }
@@ -1166,7 +1334,8 @@ export function createRenderer(options: RendererOptions = {}): Renderer {
     const fbo = gl.createFramebuffer();
     if (tex === null || fbo === null) throw new RendererError(`renderer.ts: could not allocate ${label}`);
     bindTex(0, tex);
-    gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA16F, width, height);
+    const mipLevels = mips ? Math.floor(Math.log2(Math.max(width, height))) + 1 : 1;
+    gl.texStorage2D(gl.TEXTURE_2D, mipLevels, gl.RGBA16F, width, height);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
@@ -1216,9 +1385,9 @@ export function createRenderer(options: RendererOptions = {}): Renderer {
     gl.bindRenderbuffer(gl.RENDERBUFFER, null);
     const made: ColorTarget[] = [];
     try {
-      const sceneA = createColorTarget('scene A', width, height, depth);
+      const sceneA = createColorTarget('scene A', width, height, depth, true);
       made.push(sceneA);
-      const sceneB = createColorTarget('scene B', width, height, depth);
+      const sceneB = createColorTarget('scene B', width, height, depth, true);
       made.push(sceneB);
       const down: ColorTarget[] = [];
       let w = width;
@@ -1638,12 +1807,103 @@ export function createRenderer(options: RendererOptions = {}): Renderer {
     return bMin <= BH_LENS_LIMIT_RG * rgM;
   }
 
+  /** The PlasmaDisk of this hole: created on first use, rebuilt when its settings change, stepped in simulation time. */
+  function plasmaFor(b: BlackHoleBody, disk: BlackHoleDisk, outerRg: number): PlasmaDisk {
+    const bh = settings.blackHole;
+    const innerRg = disk.innerRg ?? 0;
+    let e = plasmaCache.get(b);
+    if (
+      e !== undefined &&
+      (e.spin !== b.spin ||
+        e.outerRg !== outerRg ||
+        e.innerRg !== innerRg ||
+        e.size !== bh.plasmaSize ||
+        e.updateHz !== bh.plasmaUpdateHz)
+    ) {
+      e.plasma.dispose(gl);
+      plasmaCache.delete(b);
+      e = undefined;
+    }
+    const rgSeconds = b.rgM / C_LIGHT;
+    if (e === undefined) {
+      const plasma = new PlasmaDisk({
+        spin: b.spin,
+        outerRg,
+        innerRg,
+        width: bh.plasmaSize,
+        height: bh.plasmaSize,
+        updateHz: bh.plasmaUpdateHz,
+      });
+      plasma.setTime(fc.simTime / rgSeconds);
+      e = {
+        plasma,
+        spin: b.spin,
+        outerRg,
+        innerRg,
+        size: bh.plasmaSize,
+        updateHz: bh.plasmaUpdateHz,
+        lastSim: fc.simTime,
+        pendingSim: 0,
+        pendingReal: 0,
+        lastUsedFrame: frameIndex,
+      };
+      plasmaCache.set(b, e);
+      return plasma;
+    }
+    const dSim = fc.simTime - e.lastSim;
+    if (dSim > 0) e.pendingSim += dSim;
+    e.lastSim = fc.simTime;
+    e.pendingReal += fc.dt;
+    e.lastUsedFrame = frameIndex;
+    // The CPU rebuild is expensive: hand time to the plasma at most plasmaUpdateHz times per real second,
+    // and only when simulation time actually advanced (never while paused).
+    if (e.pendingSim > 0 && e.pendingReal >= 1 / e.updateHz) {
+      e.plasma.step(e.pendingSim, rgSeconds);
+      e.pendingSim = 0;
+      e.pendingReal = 0;
+    }
+    return e.plasma;
+  }
+
+  function evictPlasma(): void {
+    for (const [body, e] of plasmaCache) {
+      if (frameIndex - e.lastUsedFrame > PLASMA_EVICT_FRAMES) {
+        e.plasma.dispose(gl);
+        plasmaCache.delete(body);
+      }
+    }
+  }
+
+  /** The history target at the current size (recreated, and marked invalid, when the size changed). */
+  function ensureHistory(t: TargetSet): ColorTarget {
+    const h = bhState.target;
+    if (h !== null && h.width === t.width && h.height === t.height) return h;
+    if (h !== null) deleteColorTarget(h);
+    const made = createColorTarget('black hole history', t.width, t.height, null);
+    bhState.target = made;
+    bhState.valid = false;
+    return made;
+  }
+
+  /**
+   * The previous output may be blended in only for the same hole, the same settings and a camera that
+   * moved less than half a pixel of parallax (the shader reprojects rotation only).
+   */
+  function historyUsable(b: BlackHoleBody, it: Item): boolean {
+    const h = bhState;
+    if (!h.valid || h.body !== b || h.settingsRev !== settingsRevision) return false;
+    const pxAng = (2 * fc.tanY) / fc.height;
+    return Math.hypot(it.x - h.x, it.y - h.y, it.z - h.z) <= 0.5 * pxAng * it.dist;
+  }
+
   function drawBlackHole(b: BlackHoleBody, it: Item): void {
     const disk = b.disk ?? null;
+    const jet = b.jet !== undefined && b.jet !== null && b.jet.gain > 0 ? b.jet : null;
     const outerRg = disk?.outerRg ?? BLACK_HOLE_DEFAULTS.outerRg;
     const boundRg =
       b.boundRg ?? Math.max(BLACK_HOLE_DEFAULTS.boundMinRg, outerRg * BLACK_HOLE_DEFAULTS.boundOverOuter);
-    if (!blackHoleReaches(it, b.rgM, boundRg)) return;
+    const reachRg = jet === null ? boundRg : Math.max(boundRg, jet.lengthRg * 1.05);
+    if (!blackHoleReaches(it, b.rgM, reachRg)) return;
 
     const t = targets();
     const src = t.scene[sceneCur];
@@ -1652,6 +1912,14 @@ export function createRenderer(options: RendererOptions = {}): Renderer {
 
     const p = getProgram('blackhole');
     if (p === null) return;
+    const bh = settings.blackHole;
+    const first = bhDrawn === 0;
+    bhDrawn += 1;
+    const plasma = disk !== null && bh.plasmaMix > 0 ? plasmaFor(b, disk, outerRg) : null;
+    const hist = first && bh.temporalBlend > 0 ? ensureHistory(t) : null;
+    const histOk = hist !== null && historyUsable(b, it);
+    const mip = bh.maxFootprintPx > 0;
+
     const meta = SHADERS.blackhole;
     bindFbo(dst.fbo);
     gl.viewport(0, 0, t.width, t.height);
@@ -1666,12 +1934,14 @@ export function createRenderer(options: RendererOptions = {}): Renderer {
     f1(p, 'uRg', b.rgM);
     v3(p, 'uSpinAxis', unit(b.spinAxis ?? AXIS_Y, AXIS_Y));
     f1(p, 'uSpin', b.spin);
+    f1(p, 'uKerr', bh.kerr ? 1 : 0);
     f1(p, 'uBoundRg', boundRg);
     f1(p, 'uDiskInnerRg', disk?.innerRg ?? 0);
     f1(p, 'uDiskOuterRg', outerRg);
     f1(p, 'uDiskHeight', disk?.heightRatio ?? BLACK_HOLE_DEFAULTS.heightRatio);
     f1(p, 'uDiskTemperature', disk === null ? 0 : disk.peakTemperatureK);
     f1(p, 'uDiskOpacity', disk === null ? 0 : (disk.opacity ?? BLACK_HOLE_DEFAULTS.opacity));
+    f1(p, 'uDiskVisTemp', disk?.visTempK ?? BLACK_HOLE_DEFAULTS.visTempK);
     let gain = 0;
     if (disk !== null) {
       if (disk.gain !== undefined) {
@@ -1689,10 +1959,83 @@ export function createRenderer(options: RendererOptions = {}): Renderer {
     // Rays leaving the screen see the CMB level when that pass drew, otherwise black.
     const lvl = cmbDrawn ? settings.cmb.level : 0;
     f3(p, 'uFallback', CMB_TINT[0] * lvl, CMB_TINT[1] * lvl, CMB_TINT[2] * lvl);
-    bindTex(0, src.tex);
-    i1(p, 'uSceneColor', 0);
+
+    // Jets (gain is display-referred, like the disk's).
+    f1(p, 'uJetGain', jet === null ? 0 : jet.gain / fc.exposure);
+    f1(p, 'uJetLengthRg', jet === null ? 0 : jet.lengthRg);
+    f1(p, 'uJetWidth', jet === null ? 0 : jet.widthRg);
+
+    // Supersampling, mip-filtered lensing and temporal smoothing. The sub-pixel jitter only runs while the
+    // history is in use, otherwise it would just shimmer.
+    const jn = (frameIndex % 16) + 1;
+    i1(p, 'uSamples', bh.samples);
+    f2(p, 'uJitter', histOk ? halton(jn, 2) - 0.5 : 0, histOk ? halton(jn, 3) - 0.5 : 0);
+    f1(p, 'uMaxFootprint', bh.maxFootprintPx);
+    f1(p, 'uTemporalBlend', hist === null ? 0 : bh.temporalBlend);
+    f1(p, 'uHistoryValid', histOk ? 1 : 0);
+    f3(p, 'uPrevCamRight', bhState.rx, bhState.ry, bhState.rz);
+    f3(p, 'uPrevCamUp', bhState.ux, bhState.uy, bhState.uz);
+    f3(p, 'uPrevCamForward', bhState.fx, bhState.fy, bhState.fz);
+    f2(p, 'uPrevTanHalfFov', bhState.tanX, bhState.tanY);
+
+    // Plasma texture (unit 2). PlasmaDisk.upload binds on the active unit, so select it first and record it.
+    if (plasma !== null) {
+      selectUnit(PLASMA_UNIT);
+      stTex[PLASMA_UNIT] = plasma.upload(gl);
+      f1(p, 'uPlasmaMix', bh.plasmaMix);
+      f2(p, 'uPlasmaSize', plasma.width, plasma.height);
+    } else {
+      bindTex(PLASMA_UNIT, blackTex);
+      f1(p, 'uPlasmaMix', 0);
+      f2(p, 'uPlasmaSize', 1, 1);
+    }
+    i1(p, 'uPlasma', PLASMA_UNIT);
+
+    bindTex(HISTORY_UNIT, hist !== null && histOk ? hist.tex : blackTex);
+    i1(p, 'uHistory', HISTORY_UNIT);
+
+    bindTex(SCENE_UNIT, src.tex);
+    if (mip) {
+      selectUnit(SCENE_UNIT);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+      gl.generateMipmap(gl.TEXTURE_2D);
+    }
+    i1(p, 'uSceneColor', SCENE_UNIT);
     drawFullscreen();
-    bindTex(0, null);
+    if (mip) {
+      selectUnit(SCENE_UNIT);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    }
+    bindTex(SCENE_UNIT, null);
+    bindTex(HISTORY_UNIT, null);
+    bindTex(PLASMA_UNIT, null);
+
+    if (hist !== null) {
+      // Keep this pass's output as the next frame's history (scissor is off, so the blit covers the frame).
+      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, dst.fbo);
+      gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, hist.fbo);
+      gl.blitFramebuffer(0, 0, t.width, t.height, 0, 0, t.width, t.height, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+      stFbo = undefined;
+      bhState.valid = true;
+      bhState.body = b;
+      bhState.settingsRev = settingsRevision;
+      bhState.x = it.x;
+      bhState.y = it.y;
+      bhState.z = it.z;
+      bhState.rx = fc.right[0];
+      bhState.ry = fc.right[1];
+      bhState.rz = fc.right[2];
+      bhState.ux = fc.up[0];
+      bhState.uy = fc.up[1];
+      bhState.uz = fc.up[2];
+      bhState.fx = fc.forward[0];
+      bhState.fy = fc.forward[1];
+      bhState.fz = fc.forward[2];
+      bhState.tanX = fc.tanX;
+      bhState.tanY = fc.tanY;
+    } else if (first) {
+      bhState.valid = false;
+    }
     sceneCur = sceneCur === 0 ? 1 : 0;
   }
 
@@ -1865,6 +2208,7 @@ export function createRenderer(options: RendererOptions = {}): Renderer {
     const t = targets();
     const on = settings.passes;
     poolUsed = 0;
+    bhDrawn = 0;
     galaxyList.length = 0;
     nebulaList.length = 0;
     pulsarList.length = 0;
@@ -2107,6 +2451,7 @@ export function createRenderer(options: RendererOptions = {}): Renderer {
       width: frame.width,
       height: frame.height,
       time: frame.simTime % TIME_WRAP_S,
+      dt: frame.dt,
       simTime: frame.simTime,
       simSpeed: frame.simSpeed,
       paused: frame.paused,
@@ -2130,7 +2475,10 @@ export function createRenderer(options: RendererOptions = {}): Renderer {
     present(lastBloom);
 
     frameIndex += 1;
-    if (frameIndex % 60 === 0) evictStars();
+    if (frameIndex % 60 === 0) {
+      evictStars();
+      evictPlasma();
+    }
   }
 
   // ---- lifecycle -----------------------------------------------------------------------------
@@ -2159,11 +2507,17 @@ export function createRenderer(options: RendererOptions = {}): Renderer {
       }
       if (tgt !== null) deleteTargets(tgt);
       for (const g of starCache.values()) deleteGpuStars(g);
+      for (const e of plasmaCache.values()) e.plasma.dispose(gl);
+      if (bhState.target !== null) deleteColorTarget(bhState.target);
       if (fullscreenVao !== null) gl.deleteVertexArray(fullscreenVao);
       if (blackTex !== null) gl.deleteTexture(blackTex);
     }
     slots.clear();
     starCache.clear();
+    plasmaCache.clear();
+    bhState.target = null;
+    bhState.valid = false;
+    bhState.body = null;
     fullscreenVao = null;
     blackTex = null;
     tgt = null;
