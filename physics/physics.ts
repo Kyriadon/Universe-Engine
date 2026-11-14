@@ -8,20 +8,21 @@
  *   G = temperature / Novikov-Thorne temperature (~1; heating + arm shocks)
  *   B = hot-spot / flare brightness (>= 0; orbiting, shearing blobs)
  *   A = 1 (reserved)
- * The plasma is already advanced to the current time (Keplerian shear, density-wave arms, orbiting flares);
- * the shader does not rotate it. Renderer uniforms: uPlasma, uPlasmaMix, uPlasmaSize (set by bindUniforms).
+ * The plasma is already advanced to the time it was built for (Keplerian shear, density-wave arms, orbiting
+ * flares); the shader does not rotate it.
  *
- * Usage:
- *   const plasma = new PlasmaDisk({ spin: 0.9, outerRg: 30 });
- *   each frame:  plasma.step(dtSeconds, rgSeconds);   // rgSeconds = G*M/c^3 of the hole (R_g / c in seconds)
- *                plasma.upload(gl);                    // only re-uploads when step() changed the data
- *                gl.useProgram(blackholeProgram); plasma.bindUniforms(gl, blackholeProgram, 4, 1.0);
+ * The texture is generated on the CPU, but in small time slices, so a rebuild never stalls a frame:
+ *   const plasma = new PlasmaDisk({ spin: 0.9, outerRg: 30, timeRg });
+ *   each frame:  plasma.step(dtSeconds, rgSeconds);   // advances time; starts a new build once the plasma has moved enough
+ *                plasma.work(budgetMs);                // continues the running build for at most budgetMs
+ *                if (plasma.ready) tex = plasma.upload(gl);   // binds the texture on the active unit, re-uploads only a finished build
+ * A finished build is swapped in whole (double buffered), so the GPU never sees a half-built texture.
  */
 import { iscoRadiusRg } from '../graphics/shaders';
 
 const TAU = Math.PI * 2;
 /** Shear is bounded by cross-fading two phases of this length (R_g/c): keeps structure resolvable in the texture. */
-const FLOW_CYCLE = 120;
+const FLOW_CYCLE = 50;
 const HOTSPOTS = 6;
 const ARMS = 2;
 
@@ -36,8 +37,8 @@ export interface PlasmaOptions {
   readonly width?: number;
   readonly height?: number;
   readonly seed?: number;
-  /** Maximum texture refresh rate (Hz of real time). Default 8. */
-  readonly updateHz?: number;
+  /** Simulation time (R_g / c) the first build is made for. Default 0. */
+  readonly timeRg?: number;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -93,28 +94,47 @@ interface HotSpot {
   amp: number;
 }
 
+/** One texture build in progress: the frozen inputs, where it is, and the buffers it writes. */
+interface BuildJob {
+  readonly t: number;
+  readonly tau0: number;
+  readonly tau1: number;
+  readonly phase: number;
+  readonly lnGap: number;
+  readonly patternOmega: number;
+  readonly spots: readonly HotSpot[];
+  readonly out: Float32Array[];
+  /** 0: density / hot spots, one row per step; 1: normalise and derive temperature, one row per step. */
+  stage: 0 | 1;
+  row: number;
+  sumW: number;
+  sumRho: number;
+}
+
 // ---------------------------------------------------------------------------------------------
 export class PlasmaDisk {
   readonly rIn: number;
   readonly rOut: number;
   readonly width: number;
   readonly height: number;
-  /** Mip level 0, RGBA float32, row-major: index ((j * width + i) * 4), i = radial (u), j = azimuth (v). */
-  readonly data: Float32Array;
 
   private readonly spin: number;
   private readonly seed: number;
-  private readonly minInterval: number;
   private readonly lnIn: number;
   private readonly lnSpan: number;
-  private readonly levels: Float32Array[] = [];
+  /** The plasma has to move this far (R_g / c) before another build is worth starting: half a texel in azimuth at the fastest orbit. */
+  private readonly minStepRg: number;
   private readonly levelSizes: [number, number][] = [];
-  private timeRg = 0;
-  private sinceUpdate = Infinity;
-  private dirty = true;
+  /** The mip chain the GPU texture is uploaded from, and the one the next build writes into. */
+  private frontChain: Float32Array[];
+  private backChain: Float32Array[];
+  private timeRg: number;
+  private builtTimeRg: number;
+  private job: BuildJob | null = null;
+  private isReady = false;
+  private dirty = false;
 
   private texture: WebGLTexture | null = null;
-  private readonly uniformCache = new WeakMap<WebGLProgram, Record<'tex' | 'mix' | 'size', WebGLUniformLocation | null>>();
 
   constructor(options: PlasmaOptions) {
     this.spin = Math.min(Math.max(options.spin, 0), 0.998);
@@ -123,61 +143,76 @@ export class PlasmaDisk {
     this.width = Math.max(8, options.width ?? 256);
     this.height = Math.max(8, options.height ?? 256);
     this.seed = options.seed ?? 1337;
-    this.minInterval = 1 / Math.max(options.updateHz ?? 8, 0.1);
     this.lnIn = Math.log(this.rIn);
     this.lnSpan = Math.log(this.rOut / this.rIn);
-    this.data = new Float32Array(this.width * this.height * 4);
+    this.minStepRg = Math.PI / this.height / this.omega(this.rIn);
+    this.timeRg = options.timeRg ?? 0;
+    this.builtTimeRg = this.timeRg;
 
     let w = this.width, h = this.height;
-    this.levels.push(this.data);
     this.levelSizes.push([w, h]);
     while (w > 1 || h > 1) {
       w = Math.max(1, w >> 1);
       h = Math.max(1, h >> 1);
-      this.levels.push(new Float32Array(w * h * 4));
       this.levelSizes.push([w, h]);
     }
-    this.rebuild();
+    const make = (): Float32Array[] => this.levelSizes.map(([lw, lh]) => new Float32Array(lw * lh * 4));
+    this.frontChain = make();
+    this.backChain = make();
+    this.beginBuild();
   }
 
-  /** Simulation time in R_g / c. */
-  get time(): number {
-    return this.timeRg;
+  /** True once the first build has finished; until then there is nothing to upload. */
+  get ready(): boolean {
+    return this.isReady;
   }
 
   /**
-   * Advance the plasma. dtSeconds = simulated seconds, rgSeconds = G*M/c^3 of the black hole (the time light needs
-   * to cross one R_g; ~21 s for Sgr A*). Returns true when the texture data was regenerated.
+   * Advance the plasma clock. dtSeconds = simulated seconds, rgSeconds = G*M/c^3 of the black hole (the time light
+   * needs to cross one R_g; ~21 s for Sgr A*). Starts a new build when none is running and the plasma has moved at
+   * least half a texel at the fastest orbit since the last one started. Does no heavy work itself: call work().
    */
-  step(dtSeconds: number, rgSeconds: number): boolean {
+  step(dtSeconds: number, rgSeconds: number): void {
+    if (!(dtSeconds > 0)) return;
     this.timeRg += dtSeconds / Math.max(rgSeconds, 1e-9);
-    this.sinceUpdate += dtSeconds > 0 ? Math.min(dtSeconds, 1) : 0;
-    return this.maybeRebuild();
+    if (this.job === null && Math.abs(this.timeRg - this.builtTimeRg) >= this.minStepRg) this.beginBuild();
   }
 
-  /** Jump to an absolute simulation time (R_g / c) and rebuild immediately. */
-  setTime(timeRg: number): void {
-    this.timeRg = timeRg;
-    this.rebuild();
-  }
-
-  private maybeRebuild(): boolean {
-    if (this.sinceUpdate < this.minInterval) return false;
-    this.rebuild();
-    return true;
+  /**
+   * Continue the running build for about budgetMs (at least one row). Returns true when a build finished during
+   * this call, i.e. when upload() will push new data.
+   */
+  work(budgetMs: number): boolean {
+    const job = this.job;
+    if (job === null) return false;
+    const end = performance.now() + Math.max(budgetMs, 0);
+    do {
+      if (job.stage === 0) this.densityRow(job, job.row);
+      else this.finishRow(job, job.row);
+      job.row += 1;
+      if (job.row >= this.height) {
+        if (job.stage === 0) {
+          job.stage = 1;
+          job.row = 0;
+        } else {
+          this.complete(job);
+          return true;
+        }
+      }
+    } while (performance.now() < end);
+    return false;
   }
 
   private omega(r: number): number {
     return 1 / (Math.pow(r, 1.5) + this.spin);
   }
 
-  private rebuild(): void {
-    this.sinceUpdate = 0;
-    const { width: W, height: H, data, seed } = this;
+  /** Freeze the inputs for the current time (flow phase, hot spots) and start a build into the back buffer. */
+  private beginBuild(): void {
     const t = this.timeRg;
-    const phase = (t / FLOW_CYCLE) % 1;
-    const tau0 = FLOW_CYCLE * phase;
-    const tau1 = FLOW_CYCLE * (phase - 1);
+    this.builtTimeRg = t;
+    const { seed } = this;
+    const phase = (((t / FLOW_CYCLE) % 1) + 1) % 1;
     const lnGap = this.lnIn + this.lnSpan * 0.55;
     const patternOmega = this.omega(Math.exp(this.lnIn + this.lnSpan * 0.4));
 
@@ -194,73 +229,101 @@ export class PlasmaDisk {
         phi: TAU * hash(k, epoch, 2, seed) + this.omega(Math.exp(lnR)) * t,
         sigmaLnR: 0.05 + 0.03 * hash(k, epoch, 4, seed),
         sigmaPhi: 0.12 + 0.35 * age,
-        amp: 3 * env * env * (0.6 + 0.8 * hash(k, epoch, 5, seed)),
+        amp: 4 * env * env * (0.6 + 0.8 * hash(k, epoch, 5, seed)),
       });
     }
 
-    // Pass 1: raw density, temperature noise (stored temporarily in B), hot spots.
-    let sumW = 0, sumRho = 0;
-    for (let j = 0; j < H; j++) {
-      const phi = ((j + 0.5) / H - 0.5) * TAU;
-      for (let i = 0; i < W; i++) {
-        const lnR = this.lnIn + ((i + 0.5) / W) * this.lnSpan;
-        const r = Math.exp(lnR);
-        const om = this.omega(r);
-        let rho = 0, tn = 0;
-        for (let layer = 0; layer < 2; layer++) {
-          const tau = layer === 0 ? tau0 : tau1;
-          const wgt = layer === 0 ? 1 - phase : phase;
-          const p0 = phi - om * tau;
-          const x = r * Math.cos(p0) * 0.35, y = r * Math.sin(p0) * 0.35;
-          const n = fbm(x, y, lnR * 0.9, 4, seed);
-          const n2 = fbm(x * 1.7 + 11, y * 1.7 + 3, lnR * 2.1, 3, seed + 101);
-          rho += wgt * Math.exp(1.6 * (n - 0.5));
-          tn += wgt * (n2 - 0.5);
-        }
-        const armPhase = ARMS * (phi - patternOmega * t - lnR / 0.35);
-        const taper = Math.sin(Math.PI * Math.min(Math.max((lnR - this.lnIn) / this.lnSpan, 0), 1));
-        rho *= 1 + 0.45 * Math.cos(armPhase) * taper;
-        const g = (lnR - lnGap) / 0.05;
-        rho *= 1 - 0.75 * Math.exp(-g * g);
+    this.job = {
+      t,
+      tau0: FLOW_CYCLE * phase,
+      tau1: FLOW_CYCLE * (phase - 1),
+      phase,
+      lnGap,
+      patternOmega,
+      spots,
+      out: this.backChain,
+      stage: 0,
+      row: 0,
+      sumW: 0,
+      sumRho: 0,
+    };
+  }
 
-        let flare = 0;
-        for (const s of spots) {
-          const dr = (lnR - s.lnR) / s.sigmaLnR;
-          const dp = wrapPi(phi - s.phi) / s.sigmaPhi;
-          flare += s.amp * Math.exp(-0.5 * (dr * dr + dp * dp));
-        }
-
-        const o = (j * W + i) * 4;
-        data[o] = rho;
-        data[o + 1] = 0.5 * Math.cos(armPhase) * taper;
-        data[o + 2] = flare;
-        data[o + 3] = tn;
-        const area = r * r;
-        sumW += area;
-        sumRho += area * rho;
+  /** Pass 1, one azimuth row: raw density, temperature noise (stored temporarily in A), hot spots. */
+  private densityRow(job: BuildJob, j: number): void {
+    const { width: W, height: H, seed } = this;
+    const data = job.out[0]!;
+    const phi = ((j + 0.5) / H - 0.5) * TAU;
+    for (let i = 0; i < W; i++) {
+      const lnR = this.lnIn + ((i + 0.5) / W) * this.lnSpan;
+      const r = Math.exp(lnR);
+      const om = this.omega(r);
+      let rho = 0, tn = 0;
+      for (let layer = 0; layer < 2; layer++) {
+        const tau = layer === 0 ? job.tau0 : job.tau1;
+        const wgt = layer === 0 ? 1 - job.phase : job.phase;
+        const p0 = phi - om * tau;
+        const x = r * Math.cos(p0) * 0.5, y = r * Math.sin(p0) * 0.5;
+        const n = fbm(x, y, lnR * 2.2, 4, seed);
+        const n2 = fbm(x * 1.7 + 11, y * 1.7 + 3, lnR * 3.5, 3, seed + 101);
+        rho += wgt * Math.exp(2.4 * (n - 0.5));
+        tn += wgt * (n2 - 0.5);
       }
-    }
+      const armPhase = ARMS * (phi - job.patternOmega * job.t - lnR / 0.35);
+      const taper = Math.sin(Math.PI * Math.min(Math.max((lnR - this.lnIn) / this.lnSpan, 0), 1));
+      rho *= 1 + 0.45 * Math.cos(armPhase) * taper;
+      const g = (lnR - job.lnGap) / 0.05;
+      rho *= 1 - 0.75 * Math.exp(-g * g);
 
-    // Pass 2: normalise the mean density to 1, derive temperature, finish channels.
-    const inv = sumW / Math.max(sumRho, 1e-9);
-    for (let k = 0; k < W * H; k++) {
-      const o = k * 4;
-      const rho = Math.min(Math.max(data[o]! * inv, 0.04), 6);
+      let flare = 0;
+      for (const s of job.spots) {
+        const dr = (lnR - s.lnR) / s.sigmaLnR;
+        const dp = wrapPi(phi - s.phi) / s.sigmaPhi;
+        flare += s.amp * Math.exp(-0.5 * (dr * dr + dp * dp));
+      }
+
+      const o = (j * W + i) * 4;
+      data[o] = rho;
+      data[o + 1] = 0.5 * Math.cos(armPhase) * taper;
+      data[o + 2] = flare;
+      data[o + 3] = tn;
+      const area = r * r;
+      job.sumW += area;
+      job.sumRho += area * rho;
+    }
+  }
+
+  /** Pass 2, one azimuth row: normalise the mean density to 1, derive temperature, finish the channels. */
+  private finishRow(job: BuildJob, j: number): void {
+    const W = this.width;
+    const data = job.out[0]!;
+    const inv = job.sumW / Math.max(job.sumRho, 1e-9);
+    for (let i = 0; i < W; i++) {
+      const o = (j * W + i) * 4;
+      const rho = Math.min(Math.max(data[o]! * inv, 0.2), 6);
       const armShock = Math.max(data[o + 1]!, 0);
       const tn = data[o + 3]!;
-      const temp = 1 + 0.3 * Math.tanh(0.7 * Math.log(rho)) + 0.15 * armShock + 0.3 * tn;
+      const temp = 1 + 0.3 * Math.tanh(0.7 * Math.log(rho)) + 0.15 * armShock + 0.4 * tn;
       data[o] = rho;
       data[o + 1] = Math.min(Math.max(temp, 0.6), 1.8);
       data[o + 3] = 1;
     }
+  }
 
-    this.buildMips();
+  /** Mips of the finished back buffer, then swap it to the front. */
+  private complete(job: BuildJob): void {
+    this.buildMips(job.out);
+    const old = this.frontChain;
+    this.frontChain = job.out;
+    this.backChain = old;
+    this.job = null;
+    this.isReady = true;
     this.dirty = true;
   }
 
-  private buildMips(): void {
-    for (let l = 1; l < this.levels.length; l++) {
-      const src = this.levels[l - 1]!, dst = this.levels[l]!;
+  private buildMips(levels: Float32Array[]): void {
+    for (let l = 1; l < levels.length; l++) {
+      const src = levels[l - 1]!, dst = levels[l]!;
       const [sw, sh] = this.levelSizes[l - 1]!;
       const [dw, dh] = this.levelSizes[l]!;
       for (let y = 0; y < dh; y++) {
@@ -281,56 +344,40 @@ export class PlasmaDisk {
   // -------------------------------------------------------------------------------------------
   // WebGL2 side
   // -------------------------------------------------------------------------------------------
-  /** Creates the RGBA16F texture on first call, afterwards re-uploads only when the data changed. */
+  /**
+   * Creates the RGBA16F texture on first call, binds it on the ACTIVE texture unit every call, and re-uploads
+   * only when a build finished since the last call. Call it only once ready is true.
+   */
   upload(gl: WebGL2RenderingContext): WebGLTexture {
-    if (!this.texture) {
-      const tex = gl.createTexture();
-      if (!tex) throw new Error('PlasmaDisk: could not create texture');
-      this.texture = tex;
-      gl.bindTexture(gl.TEXTURE_2D, tex);
-      gl.texStorage2D(gl.TEXTURE_2D, this.levels.length, gl.RGBA16F, this.width, this.height);
+    let tex = this.texture;
+    if (tex === null) {
+      const made = gl.createTexture();
+      if (!made) throw new Error('PlasmaDisk: could not create texture');
+      tex = made;
+      this.texture = made;
+      gl.bindTexture(gl.TEXTURE_2D, made);
+      gl.texStorage2D(gl.TEXTURE_2D, this.levelSizes.length, gl.RGBA16F, this.width, this.height);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_BASE_LEVEL, 0);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAX_LEVEL, this.levels.length - 1);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAX_LEVEL, this.levelSizes.length - 1);
       this.dirty = true;
+    } else {
+      gl.bindTexture(gl.TEXTURE_2D, tex);
     }
     if (this.dirty) {
-      gl.bindTexture(gl.TEXTURE_2D, this.texture);
       const prevAlign = gl.getParameter(gl.UNPACK_ALIGNMENT) as number;
       gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
-      for (let l = 0; l < this.levels.length; l++) {
+      for (let l = 0; l < this.levelSizes.length; l++) {
         const [w, h] = this.levelSizes[l]!;
-        gl.texSubImage2D(gl.TEXTURE_2D, l, 0, 0, w, h, gl.RGBA, gl.FLOAT, this.levels[l]!);
+        gl.texSubImage2D(gl.TEXTURE_2D, l, 0, 0, w, h, gl.RGBA, gl.FLOAT, this.frontChain[l]!);
       }
       gl.pixelStorei(gl.UNPACK_ALIGNMENT, prevAlign);
       this.dirty = false;
     }
-    return this.texture;
-  }
-
-  /**
-   * Binds the texture to `unit` and sets uPlasma, uPlasmaMix, uPlasmaSize on `program`.
-   * Call gl.useProgram(program) first. mix = 0 gives the flat procedural disk, 1 full plasma.
-   */
-  bindUniforms(gl: WebGL2RenderingContext, program: WebGLProgram, unit: number, mix = 1): void {
-    const tex = this.upload(gl);
-    let locs = this.uniformCache.get(program);
-    if (!locs) {
-      locs = {
-        tex: gl.getUniformLocation(program, 'uPlasma'),
-        mix: gl.getUniformLocation(program, 'uPlasmaMix'),
-        size: gl.getUniformLocation(program, 'uPlasmaSize'),
-      };
-      this.uniformCache.set(program, locs);
-    }
-    gl.activeTexture(gl.TEXTURE0 + unit);
-    gl.bindTexture(gl.TEXTURE_2D, tex);
-    gl.uniform1i(locs.tex, unit);
-    gl.uniform1f(locs.mix, Math.min(Math.max(mix, 0), 1));
-    gl.uniform2f(locs.size, this.width, this.height);
+    return tex;
   }
 
   dispose(gl: WebGL2RenderingContext): void {
