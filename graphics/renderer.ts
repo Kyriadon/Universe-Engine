@@ -511,7 +511,8 @@ export const DEFAULT_RENDERER_SETTINGS: Readonly<RendererSettings> = {
     aurora: true,
     bloom: true,
   },
-  cmb: { temperatureK: 2.725, level: 0.01, contrast: 0.05 },
+  // Genuinely black sky: the real CMB is invisible and the background pass draws no noise or stars. Raise level for a faint glow.
+  cmb: { temperatureK: 2.725, level: 0, contrast: 0 },
   cosmicWeb: {
     cellSizeM: CELL_SIZE_M[Tier.Supercluster] as number,
     minDistCells: 0.25,
