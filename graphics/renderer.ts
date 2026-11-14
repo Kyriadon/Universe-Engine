@@ -23,7 +23,9 @@
  *                `writesDepth`, the ping-pong path from `readsScene`.
  *   physics.ts   PlasmaDisk: the accretion-disk plasma texture the blackhole shader samples
  *                (uPlasma, uPlasmaMix, uPlasmaSize). One PlasmaDisk per black hole that has a
- *                disk, created on first draw, advanced by simulation time, uploaded on unit 2.
+ *                disk, created on first draw, built on the CPU in small per-frame time slices
+ *                (plasmaBudgetMs), rotated per frame in the shader (uPlasmaAge), uploaded on unit 2. Until its first
+ *                build finishes the disk is drawn with the flat procedural look (uPlasmaMix 0).
  *
  * Draw order (shaders.ts header)
  *   background, cosmicWeb, galaxies, nebulae, stars, pulsars, then black holes and planet
@@ -118,8 +120,9 @@ export interface RendererSettings {
    *   It fades out smoothly with camera translation, and rises towards 0.9 (less at high simulation
    *   speed) while the camera is still, so the sub-pixel jitter (uJitter) converges instead of shimmering.
    * plasmaMix: 0..1, 0 = flat procedural disk, 1 = full PlasmaDisk texture (uPlasmaMix).
-   * plasmaSize: PlasmaDisk texels per side (the CPU cost of one rebuild grows with its square).
-   * plasmaUpdateHz: most PlasmaDisk rebuilds per real second.
+   * plasmaSize: PlasmaDisk texels per side (a bigger texture is sharper but takes longer to rebuild).
+   * plasmaBudgetMs: CPU milliseconds per frame spent building the plasma texture. A rebuild is spread over
+   *   frames, so this trades how often the texture refreshes (matters at high simulation speed) for frame time.
    */
   blackHole: {
     peakLevel: number;
@@ -129,7 +132,7 @@ export interface RendererSettings {
     temporalBlend: number;
     plasmaMix: number;
     plasmaSize: number;
-    plasmaUpdateHz: number;
+    plasmaBudgetMs: number;
   };
   bloom: { strength: number; radius: number; weight: number; levels: number };
   /** Base raymarch steps at 'medium' quality and full work; clamped to each shader's maximum. */
@@ -448,6 +451,10 @@ const RES_FLOOR = 0.8001;
 const SCISSOR_PAD = 2;
 const STAR_EVICT_FRAMES = 300;
 const PLASMA_EVICT_FRAMES = 300;
+/** Budget per frame for the very first plasma build, so the disk gets its texture within a few frames. */
+const PLASMA_FIRST_BUILD_MS = 30;
+/** Largest age (R_g / c) the shader rotates a plasma texture by before the next build lands: beyond it the shear would out-resolve the texture. */
+const PLASMA_MAX_AGE_RG = 60;
 const C_LIGHT = 299792458;
 /** Texture units of the blackhole pass. */
 const SCENE_UNIT = 0;
@@ -514,14 +521,14 @@ export const DEFAULT_RENDERER_SETTINGS: Readonly<RendererSettings> = {
   },
   stars: { psfSigmaPx: 0.9, pointSizeMax: 64, spikeStrength: 1, maxPerField: 1 << 20 },
   blackHole: {
-    peakLevel: 4,
+    peakLevel: 8,
     kerr: true,
     samples: 1,
     maxFootprintPx: 16,
     temporalBlend: 0.6,
     plasmaMix: 1,
-    plasmaSize: 128,
-    plasmaUpdateHz: 2,
+    plasmaSize: 256,
+    plasmaBudgetMs: 8,
   },
   bloom: { strength: 0.06, radius: 1, weight: 0.65, levels: 6 },
   steps: { galaxy: 48, nebula: 64, clouds: 48, pulsar: 48, cosmicWeb: 32, blackHole: 256 },
@@ -579,8 +586,8 @@ function validateSettings(s: RendererSettings): void {
   if (!Number.isInteger(s.blackHole.plasmaSize) || s.blackHole.plasmaSize < 8) {
     bad('blackHole.plasmaSize must be an integer >= 8');
   }
-  if (!(s.blackHole.plasmaUpdateHz > 0 && Number.isFinite(s.blackHole.plasmaUpdateHz))) {
-    bad('blackHole.plasmaUpdateHz must be positive');
+  if (!(s.blackHole.plasmaBudgetMs > 0 && Number.isFinite(s.blackHole.plasmaBudgetMs))) {
+    bad('blackHole.plasmaBudgetMs must be positive');
   }
   if (!Number.isInteger(s.bloom.levels) || s.bloom.levels < 0) bad('bloom.levels must be a non-negative integer');
 }
@@ -805,8 +812,6 @@ interface FrameConsts {
   width: number;
   height: number;
   time: number;
-  /** Real seconds since the previous frame. */
-  dt: number;
   simTime: number;
   simSpeed: number;
   paused: boolean;
@@ -827,19 +832,15 @@ interface Item {
   kind: number;
 }
 
-/** One PlasmaDisk per black hole, with the settings it was built for and its update throttle. */
+/** One PlasmaDisk per black hole, with the settings it was built for. */
 interface PlasmaEntry {
   readonly plasma: PlasmaDisk;
   readonly spin: number;
   readonly outerRg: number;
   readonly innerRg: number;
   readonly size: number;
-  readonly updateHz: number;
   /** Simulation seconds at the previous draw. */
   lastSim: number;
-  /** Simulation and real seconds not yet handed to PlasmaDisk.step. */
-  pendingSim: number;
-  pendingReal: number;
   lastUsedFrame: number;
 }
 
@@ -986,7 +987,6 @@ export function createRenderer(options: RendererOptions = {}): Renderer {
     width: 1,
     height: 1,
     time: 0,
-    dt: 0,
     simTime: 0,
     simSpeed: 1,
     paused: false,
@@ -1811,18 +1811,14 @@ export function createRenderer(options: RendererOptions = {}): Renderer {
     return bMin <= BH_LENS_LIMIT_RG * rgM;
   }
 
-  /** The PlasmaDisk of this hole: created on first use, rebuilt when its settings change, stepped in simulation time. */
+  /** The PlasmaDisk of this hole: created on first use, rebuilt when its settings change, clocked by simulation time. */
   function plasmaFor(b: BlackHoleBody, disk: BlackHoleDisk, outerRg: number): PlasmaDisk {
     const bh = settings.blackHole;
     const innerRg = disk.innerRg ?? 0;
     let e = plasmaCache.get(b);
     if (
       e !== undefined &&
-      (e.spin !== b.spin ||
-        e.outerRg !== outerRg ||
-        e.innerRg !== innerRg ||
-        e.size !== bh.plasmaSize ||
-        e.updateHz !== bh.plasmaUpdateHz)
+      (e.spin !== b.spin || e.outerRg !== outerRg || e.innerRg !== innerRg || e.size !== bh.plasmaSize)
     ) {
       e.plasma.dispose(gl);
       plasmaCache.delete(b);
@@ -1830,46 +1826,30 @@ export function createRenderer(options: RendererOptions = {}): Renderer {
     }
     const rgSeconds = b.rgM / C_LIGHT;
     if (e === undefined) {
-      const plasma = new PlasmaDisk({
-        spin: b.spin,
-        outerRg,
-        innerRg,
-        width: bh.plasmaSize,
-        height: bh.plasmaSize,
-        // This function throttles the rebuilds itself, so PlasmaDisk's own limiter must never skip one.
-        updateHz: 1000,
-      });
-      plasma.setTime(fc.simTime / rgSeconds);
       e = {
-        plasma,
+        plasma: new PlasmaDisk({
+          spin: b.spin,
+          outerRg,
+          innerRg,
+          width: bh.plasmaSize,
+          height: bh.plasmaSize,
+          timeRg: fc.simTime / rgSeconds,
+        }),
         spin: b.spin,
         outerRg,
         innerRg,
         size: bh.plasmaSize,
-        updateHz: bh.plasmaUpdateHz,
         lastSim: fc.simTime,
-        pendingSim: 0,
-        pendingReal: 0,
         lastUsedFrame: frameIndex,
       };
       plasmaCache.set(b, e);
-      return plasma;
+    } else {
+      e.plasma.step(fc.simTime - e.lastSim, rgSeconds);
+      e.lastSim = fc.simTime;
+      e.lastUsedFrame = frameIndex;
     }
-    const dSim = fc.simTime - e.lastSim;
-    if (dSim > 0) e.pendingSim += dSim;
-    e.lastSim = fc.simTime;
-    e.pendingReal += fc.dt;
-    e.lastUsedFrame = frameIndex;
-    // The CPU rebuild is expensive (a frame hitch), so it runs only when it can show: at most plasmaUpdateHz
-    // times per real second, and only once the fastest orbit (the inner edge) has moved half a texel in
-    // azimuth. Smaller steps are invisible, and the texture is time-exact again at the next rebuild.
-    const omegaMax = 1 / (Math.pow(e.plasma.rIn, 1.5) + e.spin);
-    const minStepSim = (PI / e.size / omegaMax) * rgSeconds;
-    if (e.pendingSim >= minStepSim && e.pendingReal >= 1 / e.updateHz) {
-      e.plasma.step(e.pendingSim, rgSeconds);
-      e.pendingSim = 0;
-      e.pendingReal = 0;
-    }
+    // A rebuild is spread over frames (a few ms each) so it never stalls one; the first build runs hotter.
+    e.plasma.work(e.plasma.ready ? bh.plasmaBudgetMs : PLASMA_FIRST_BUILD_MS);
     return e.plasma;
   }
 
@@ -2003,16 +1983,23 @@ export function createRenderer(options: RendererOptions = {}): Renderer {
     f3(p, 'uPrevCamForward', bhState.fx, bhState.fy, bhState.fz);
     f2(p, 'uPrevTanHalfFov', bhState.tanX, bhState.tanY);
 
-    // Plasma texture (unit 2). PlasmaDisk.upload binds on the active unit, so select it first and record it.
-    if (plasma !== null) {
+    // Plasma texture (unit 2). PlasmaDisk.upload binds the texture on the active unit ONLY when it creates or
+    // re-uploads it, so it must always be bound explicitly afterwards (otherwise the shader samples an empty
+    // unit on every other frame and the disk renders black). The cache entry is forgotten first because
+    // upload may have changed the binding behind it.
+    if (plasma !== null && plasma.ready) {
       selectUnit(PLASMA_UNIT);
-      stTex[PLASMA_UNIT] = plasma.upload(gl);
+      const plasmaTex = plasma.upload(gl);
+      stTex[PLASMA_UNIT] = undefined;
+      bindTex(PLASMA_UNIT, plasmaTex);
       f1(p, 'uPlasmaMix', bh.plasmaMix);
       f2(p, 'uPlasmaSize', plasma.width, plasma.height);
+      f1(p, 'uPlasmaAge', clamp(fc.simTime / (b.rgM / C_LIGHT) - plasma.shownTime, 0, PLASMA_MAX_AGE_RG));
     } else {
       bindTex(PLASMA_UNIT, blackTex);
       f1(p, 'uPlasmaMix', 0);
       f2(p, 'uPlasmaSize', 1, 1);
+      f1(p, 'uPlasmaAge', 0);
     }
     i1(p, 'uPlasma', PLASMA_UNIT);
 
@@ -2476,7 +2463,6 @@ export function createRenderer(options: RendererOptions = {}): Renderer {
       width: frame.width,
       height: frame.height,
       time: frame.simTime % TIME_WRAP_S,
-      dt: frame.dt,
       simTime: frame.simTime,
       simSpeed: frame.simSpeed,
       paused: frame.paused,
