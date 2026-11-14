@@ -40,20 +40,21 @@ export const ATTRIBUTES = { position: 0, luminosity: 1, temperature: 2, radius: 
  * PLASMA CONTRACT (physics.ts -> blackhole shader). Optional: with uPlasmaMix = 0 the disk keeps its flat,
  * realistic procedural look; physics.ts only ADDS realism on top.
  * Texture: RGBA16F, LINEAR + mipmaps, wrap S = CLAMP, wrap T = REPEAT. Written in the disk's non-rotating frame
- * (physics already advects it, so the shader does no animation of its own when plasma is present).
+ * for the time it was built (physics advects it). Between rebuilds the shader rotates the lookup by the local
+ * Keplerian rate times uPlasmaAge (R_g / c since the build), so the plasma orbits smoothly at any simulation speed.
  *   u = ln(r / rIn) / ln(rOut / rIn)      r in R_g, rIn = diskInnerRg > 0 ? diskInnerRg : iscoRadiusRg(spin)
  *   v = azimuth / TAU + 0.5               azimuth = atan2(y, x) in the frame whose z axis is the spin axis
  *   R = density / mean density (clumps, spiral arms, gaps; ~1 average)
  *   G = temperature / Novikov-Thorne temperature (~1; MRI heating, shocks)
  *   B = hot-spot / flare emissivity (>= 0; magnetic reconnection, orbiting blobs)
  *   A = reserved (write 1)
- * Uniforms: uPlasma (sampler), uPlasmaMix (0..1), uPlasmaSize (texture size in texels).
+ * Uniforms: uPlasma (sampler), uPlasmaMix (0..1), uPlasmaSize (texture size in texels), uPlasmaAge (R_g / c).
  */
 export const PLASMA = {
   format: 'RGBA16F',
   channels: { r: 'density', g: 'temperature', b: 'hotspot', a: 'reserved' },
   mapping: 'u = ln(r/rIn)/ln(rOut/rIn); v = azimuth/TAU + 0.5',
-  uniforms: ['uPlasma', 'uPlasmaMix', 'uPlasmaSize'],
+  uniforms: ['uPlasma', 'uPlasmaMix', 'uPlasmaSize', 'uPlasmaAge'],
 } as const;
 
 /** ISCO radius in R_g (identical to the shader's), so physics.ts maps the plasma texture the same way. */
@@ -362,7 +363,7 @@ void main() {
 // Disk = thin opaque surface found at the equatorial-plane crossings (primary + lensed secondary images).
 // uDiskOpacity is optical depth per crossing / 20 (internally at least 3), uDiskHeight is unused.
 // uDiskVisTemp (K, default 12000): hottest displayed colour; keeps the disk glowing instead of washing to blue-white.
-// PLASMA: optional uPlasma texture from physics.ts (see PLASMA contract at the top); uPlasmaMix = 0 -> flat procedural disk.
+// PLASMA: optional uPlasma texture from physics.ts (see PLASMA contract at the top); uPlasmaMix = 0 -> flat procedural disk; uPlasmaAge (R_g/c since the texture was built) rotates it differentially.
 // Uniforms: uCenter (m), uRg (GM/c^2, m), uSpinAxis, uSpin (0..0.998), uKerr, uBoundRg (auto-raised to enclose the disk), uDiskInnerRg (<=0 -> ISCO),
 // uDiskOuterRg, uDiskHeight (H/r), uDiskTemperature (peak K), uDiskOpacity, uDiskGain, uSurfaceRg,
 // uSurfaceTemperature, uMaxSteps (<=320), uFallback, uJetGain, uJetLengthRg, uJetWidth (Rg), uSamples, uJitter (px),
@@ -403,6 +404,7 @@ uniform sampler2D uHistory;
 uniform sampler2D uPlasma;
 uniform float uPlasmaMix;
 uniform vec2 uPlasmaSize;
+uniform float uPlasmaAge;
 out vec4 fragColor;
 
 float iscoRadius(float a) {
@@ -568,7 +570,9 @@ vec3 trace(vec2 fc) {
             float lnR = log(rOut / rIn);
             float dTexel = max(rc2 * lnR / uPlasmaSize.x, rc2 * TAU / uPlasmaSize.y);
             float lod = log2(max(pxSize / dTexel, 1.0));
-            vec2 puv = vec2(clamp(log(x) / lnR, 0.0, 1.0), atan(hp.y, hp.x) / TAU + 0.5);
+            // The texture is for the time it was built: orbit it forward by the Keplerian rate since then.
+            float omP = 1.0 / (pow(rc2, 1.5) + a);
+            vec2 puv = vec2(clamp(log(x) / lnR, 0.0, 1.0), (atan(hp.y, hp.x) - omP * uPlasmaAge) / TAU + 0.5);
             pl = mix(pl, textureLod(uPlasma, puv, lod), uPlasmaMix);
           }
           float prof = 2.05 * pow(x, -0.75) * pow(max(1.0 - inversesqrt(x), 0.0), 0.25);
