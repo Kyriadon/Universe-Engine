@@ -47,6 +47,13 @@
  *   < or ,                simulation speed /10 (down to 1e-3 x real time)
  *   P                     pause / resume simulation time
  *   /                     normal simulation speed (1x) and resume
+ *
+ * Gravity
+ *   With options.gravity (physics/physics.ts) the camera is a DynamicBody: every frame the simulation time that
+ *   passed (simDt) is run through gravity.step(), which pulls the camera towards every mass and keeps its momentum when
+ *   you let go of the keys. Flight (WASD) is still applied on top, as before. Time is the simulation's, so the pull is
+ *   as real as the clock: speed time up with > to watch yourself fall, pause with P to hold still. A camera that
+ *   crosses a horizon is captured and stops being pulled (reload to start again).
  */
 
 import {
@@ -58,6 +65,7 @@ import {
   type Vec3,
   type WorldPos,
 } from '../packages/core/src/coords';
+import type { DynamicBody, GravityModel } from '../physics/physics';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -118,6 +126,8 @@ export interface GLOptions {
   readonly initialSpeed?: number;
   /** Called after the GPU context is restored so GPU resources can be rebuilt. */
   readonly onContextRestored?: (gl: WebGL2RenderingContext) => void;
+  /** Gravity that pulls the camera every frame (physics/physics.ts). Omit for a free camera. */
+  readonly gravity?: GravityModel;
 }
 
 export interface GLHandle {
@@ -365,6 +375,8 @@ export function createGL(
 
   // Camera and input.
   let camera: WorldPos = options.camera ?? makePos(Tier.Surface, [0, 0, 0], [0, 0, 0]);
+  // The camera as a body for gravity: its velocity is the momentum gravity has given it.
+  const fall: DynamicBody = { position: camera, velocity: [0, 0, 0], captured: false };
   let yaw = 0;
   let pitch = 0;
   let speed = clamp(options.initialSpeed ?? MIN_SPEED, MIN_SPEED, MAX_SPEED);
@@ -606,6 +618,11 @@ export function createGL(
     const dt = Math.min(intervalMs / 1000, MAX_DT_S);
     clock += dt;
 
+    // Simulation time.
+    const simSpeed = 10 ** simExp;
+    const simDt = paused ? 0 : dt * simSpeed;
+    simTime += simDt;
+
     // Camera.
     const basis = basisFor(yaw, pitch);
     const axisX = (keys.has('KeyD') ? 1 : 0) - (keys.has('KeyA') ? 1 : 0);
@@ -623,10 +640,12 @@ export function createGL(
       ]);
     }
 
-    // Simulation time.
-    const simSpeed = 10 ** simExp;
-    const simDt = paused ? 0 : dt * simSpeed;
-    simTime += simDt;
+    // Gravity pulls the camera (and keeps the momentum it gave it) for the simulation time that passed.
+    if (options.gravity !== undefined && simDt > 0) {
+      fall.position = camera;
+      options.gravity.step(fall, simDt);
+      camera = fall.position;
+    }
 
     // Drawing-buffer size.
     const dpr = window.devicePixelRatio || 1;
