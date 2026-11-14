@@ -8,14 +8,16 @@
  *   G = temperature / Novikov-Thorne temperature (~1; heating + arm shocks)
  *   B = hot-spot / flare brightness (>= 0; orbiting, shearing blobs)
  *   A = 1 (reserved)
- * The plasma is already advanced to the time it was built for (Keplerian shear, density-wave arms, orbiting
- * flares); the shader does not rotate it.
+ * The plasma is advanced to the time it was built for (Keplerian shear, density-wave arms, orbiting flares). The
+ * shader then rotates it by the local Keplerian rate for the time since (uPlasmaAge = now - shownTime), so it
+ * orbits smoothly every frame at any simulation speed; rebuilds only refresh the slow evolution.
  *
  * The texture is generated on the CPU, but in small time slices, so a rebuild never stalls a frame:
  *   const plasma = new PlasmaDisk({ spin: 0.9, outerRg: 30, timeRg });
  *   each frame:  plasma.step(dtSeconds, rgSeconds);   // advances time; starts a new build once the plasma has moved enough
  *                plasma.work(budgetMs);                // continues the running build for at most budgetMs
  *                if (plasma.ready) tex = plasma.upload(gl);   // binds the texture on the active unit, re-uploads only a finished build
+ *                age = timeRg - plasma.shownTime;             // -> the shader's uPlasmaAge
  * A finished build is swapped in whole (double buffered), so the GPU never sees a half-built texture.
  */
 import { iscoRadiusRg } from '../graphics/shaders';
@@ -25,6 +27,12 @@ const TAU = Math.PI * 2;
 const FLOW_CYCLE = 50;
 const HOTSPOTS = 6;
 const ARMS = 2;
+/** The shader orbits the texture between builds, so a new build is only needed for the slow evolution: every this many R_g / c. */
+const REBUILD_STEP_RG = 3;
+/** Turbulence: feature size in azimuth (cycles per radian-ish, larger = finer), in ln(r), and the density contrast. */
+const STREAK_PHI = 2.5;
+const STREAK_R = 7;
+const DENSITY_CONTRAST = 1.1;
 
 export interface PlasmaOptions {
   /** Dimensionless spin a/M, 0..0.998 (sets the ISCO and Keplerian rate). */
@@ -122,14 +130,14 @@ export class PlasmaDisk {
   private readonly seed: number;
   private readonly lnIn: number;
   private readonly lnSpan: number;
-  /** The plasma has to move this far (R_g / c) before another build is worth starting: half a texel in azimuth at the fastest orbit. */
-  private readonly minStepRg: number;
   private readonly levelSizes: [number, number][] = [];
   /** The mip chain the GPU texture is uploaded from, and the one the next build writes into. */
   private frontChain: Float32Array[];
   private backChain: Float32Array[];
   private timeRg: number;
+  /** Time the newest build was started for, and the time the texture on the front buffer was built for. */
   private builtTimeRg: number;
+  private shownTimeRg: number;
   private job: BuildJob | null = null;
   private isReady = false;
   private dirty = false;
@@ -145,9 +153,9 @@ export class PlasmaDisk {
     this.seed = options.seed ?? 1337;
     this.lnIn = Math.log(this.rIn);
     this.lnSpan = Math.log(this.rOut / this.rIn);
-    this.minStepRg = Math.PI / this.height / this.omega(this.rIn);
     this.timeRg = options.timeRg ?? 0;
     this.builtTimeRg = this.timeRg;
+    this.shownTimeRg = this.timeRg;
 
     let w = this.width, h = this.height;
     this.levelSizes.push([w, h]);
@@ -167,15 +175,20 @@ export class PlasmaDisk {
     return this.isReady;
   }
 
+  /** Simulation time (R_g / c) the uploaded texture was built for. */
+  get shownTime(): number {
+    return this.shownTimeRg;
+  }
+
   /**
    * Advance the plasma clock. dtSeconds = simulated seconds, rgSeconds = G*M/c^3 of the black hole (the time light
-   * needs to cross one R_g; ~21 s for Sgr A*). Starts a new build when none is running and the plasma has moved at
-   * least half a texel at the fastest orbit since the last one started. Does no heavy work itself: call work().
+   * needs to cross one R_g; ~21 s for Sgr A*). Starts a new build when none is running and the clock has moved
+   * REBUILD_STEP_RG since the last one started. Does no heavy work itself: call work().
    */
   step(dtSeconds: number, rgSeconds: number): void {
     if (!(dtSeconds > 0)) return;
     this.timeRg += dtSeconds / Math.max(rgSeconds, 1e-9);
-    if (this.job === null && Math.abs(this.timeRg - this.builtTimeRg) >= this.minStepRg) this.beginBuild();
+    if (this.job === null && Math.abs(this.timeRg - this.builtTimeRg) >= REBUILD_STEP_RG) this.beginBuild();
   }
 
   /**
@@ -229,7 +242,7 @@ export class PlasmaDisk {
         phi: TAU * hash(k, epoch, 2, seed) + this.omega(Math.exp(lnR)) * t,
         sigmaLnR: 0.05 + 0.03 * hash(k, epoch, 4, seed),
         sigmaPhi: 0.12 + 0.35 * age,
-        amp: 4 * env * env * (0.6 + 0.8 * hash(k, epoch, 5, seed)),
+        amp: 3 * env * env * (0.6 + 0.8 * hash(k, epoch, 5, seed)),
       });
     }
 
@@ -263,15 +276,17 @@ export class PlasmaDisk {
         const tau = layer === 0 ? job.tau0 : job.tau1;
         const wgt = layer === 0 ? 1 - job.phase : job.phase;
         const p0 = phi - om * tau;
-        const x = r * Math.cos(p0) * 0.5, y = r * Math.sin(p0) * 0.5;
-        const n = fbm(x, y, lnR * 2.2, 4, seed);
-        const n2 = fbm(x * 1.7 + 11, y * 1.7 + 3, lnR * 3.5, 3, seed + 101);
-        rho += wgt * Math.exp(2.4 * (n - 0.5));
+        // Polar noise: fine in ln(r) (thin rings that the shear winds into spirals), long in azimuth
+        // (cos/sin keeps it periodic around the disk).
+        const cx = Math.cos(p0) * STREAK_PHI, cy = Math.sin(p0) * STREAK_PHI;
+        const n = fbm(cx, cy, lnR * STREAK_R, 4, seed);
+        const n2 = fbm(cx * 1.7 + 11, cy * 1.7 + 3, lnR * STREAK_R * 1.3, 3, seed + 101);
+        rho += wgt * Math.exp(DENSITY_CONTRAST * (n - 0.5));
         tn += wgt * (n2 - 0.5);
       }
       const armPhase = ARMS * (phi - job.patternOmega * job.t - lnR / 0.35);
       const taper = Math.sin(Math.PI * Math.min(Math.max((lnR - this.lnIn) / this.lnSpan, 0), 1));
-      rho *= 1 + 0.45 * Math.cos(armPhase) * taper;
+      rho *= 1 + 0.3 * Math.cos(armPhase) * taper;
       const g = (lnR - job.lnGap) / 0.05;
       rho *= 1 - 0.75 * Math.exp(-g * g);
 
@@ -300,12 +315,13 @@ export class PlasmaDisk {
     const inv = job.sumW / Math.max(job.sumRho, 1e-9);
     for (let i = 0; i < W; i++) {
       const o = (j * W + i) * 4;
-      const rho = Math.min(Math.max(data[o]! * inv, 0.2), 6);
+      const rho = Math.min(Math.max(data[o]! * inv, 0.25), 4);
       const armShock = Math.max(data[o + 1]!, 0);
       const tn = data[o + 3]!;
-      const temp = 1 + 0.3 * Math.tanh(0.7 * Math.log(rho)) + 0.15 * armShock + 0.4 * tn;
+      // Brightness goes as temperature^4, so the temperature has to stay close to 1 or the disk turns blotchy.
+      const temp = 1 + 0.12 * Math.tanh(0.7 * Math.log(rho)) + 0.08 * armShock + 0.25 * tn;
       data[o] = rho;
-      data[o + 1] = Math.min(Math.max(temp, 0.6), 1.8);
+      data[o + 1] = Math.min(Math.max(temp, 0.7), 1.5);
       data[o + 3] = 1;
     }
   }
@@ -317,6 +333,7 @@ export class PlasmaDisk {
     this.frontChain = job.out;
     this.backChain = old;
     this.job = null;
+    this.shownTimeRg = job.t;
     this.isReady = true;
     this.dirty = true;
   }
