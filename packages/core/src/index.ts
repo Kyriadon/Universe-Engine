@@ -40,14 +40,20 @@ function toBlackHoleBody(bh: BlackHole): BlackHoleBody {
 
   const flow = bh.regions.find((r) => r.id === 'accretion-flow');
 
+  // The data has no spin axis yet: tilt it so the spawn view is ~84 degrees from the pole (almost edge-on, a
+  // little above the disk plane), which gives the classic photon-ring look. The disk is cut at 16 R_g so it
+  // stays thin and sharp at the spawn distance.
+  const oriented = { ...base, spinAxis: [0, 0.9945, 0.1045] as const };
+
   return flow?.temperatureK
     ? {
-        ...base,
+        ...oriented,
         disk: {
           peakTemperatureK: flow.temperatureK.inner,
+          outerRg: 16,
         },
       }
-    : base;
+    : oriented;
 }
 
 const scene: RenderScene = {
@@ -70,9 +76,9 @@ if (!centralBlackHole) {
   );
 }
 
-// Spawn 60 gravitational radii away from the centre of Sagittarius A*.
-// Approximately 381 million kilometres with the current Sgr A* data.
-const CAMERA_DISTANCE_M = centralBlackHole.rgM * 60;
+// Spawn 30 gravitational radii away from the centre of Sagittarius A*, so the shadow fills about a third of the
+// screen. Approximately 190 million kilometres with the current Sgr A* data.
+const CAMERA_DISTANCE_M = centralBlackHole.rgM * 30;
 
 // Position the camera directly along +Z.
 const cameraStart = translate(
