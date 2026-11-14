@@ -112,7 +112,6 @@ export interface RendererSettings {
   stars: { psfSigmaPx: number; pointSizeMax: number; spikeStrength: number; maxPerField: number };
   /**
    * peakLevel: display-referred brightness of the hottest disk pixel when a disk has no gain.
-   * kerr: Kerr null geodesics (uKerr = 1) instead of the fast Schwarzschild bending (uKerr = 0).
    * samples: integer 1..8 supersamples per pixel (uSamples).
    * maxFootprintPx: largest lensed-background footprint in pixels before it is mip-filtered
    *   (uMaxFootprint); 0 switches the mip chain off.
@@ -126,7 +125,6 @@ export interface RendererSettings {
    */
   blackHole: {
     peakLevel: number;
-    kerr: boolean;
     samples: number;
     maxFootprintPx: number;
     temporalBlend: number;
@@ -455,6 +453,8 @@ const PLASMA_EVICT_FRAMES = 300;
 const PLASMA_FIRST_BUILD_MS = 30;
 /** Largest age (R_g / c) the shader rotates a plasma texture by before the next build lands: beyond it the shear would out-resolve the texture. */
 const PLASMA_MAX_AGE_RG = 60;
+/** Disk flow cycle in R_g / c. MUST equal FLOW_CYCLE in the blackhole shader. */
+const BH_FLOW_CYCLE_RG = 60;
 const C_LIGHT = 299792458;
 /** Texture units of the blackhole pass. */
 const SCENE_UNIT = 0;
@@ -522,13 +522,12 @@ export const DEFAULT_RENDERER_SETTINGS: Readonly<RendererSettings> = {
   stars: { psfSigmaPx: 0.9, pointSizeMax: 64, spikeStrength: 1, maxPerField: 1 << 20 },
   blackHole: {
     peakLevel: 8,
-    kerr: true,
     samples: 1,
     maxFootprintPx: 16,
     temporalBlend: 0.6,
     plasmaMix: 1,
     plasmaSize: 256,
-    plasmaBudgetMs: 8,
+    plasmaBudgetMs: 3,
   },
   bloom: { strength: 0.06, radius: 1, weight: 0.65, levels: 6 },
   steps: { galaxy: 48, nebula: 64, clouds: 48, pulsar: 48, cosmicWeb: 32, blackHole: 256 },
@@ -572,7 +571,6 @@ function validateSettings(s: RendererSettings): void {
   if (!(s.stars.maxPerField >= 0)) bad('stars.maxPerField must be >= 0');
   if (!(s.maxFlashHz > 0)) bad('maxFlashHz must be positive');
   if (!(s.blackHole.peakLevel > 0)) bad('blackHole.peakLevel must be positive');
-  if (typeof s.blackHole.kerr !== 'boolean') bad('blackHole.kerr must be a boolean');
   if (!Number.isInteger(s.blackHole.samples) || s.blackHole.samples < 1 || s.blackHole.samples > 8) {
     bad('blackHole.samples must be an integer from 1 to 8');
   }
@@ -1939,7 +1937,12 @@ export function createRenderer(options: RendererOptions = {}): Renderer {
     f1(p, 'uRg', b.rgM);
     v3(p, 'uSpinAxis', unit(b.spinAxis ?? AXIS_Y, AXIS_Y));
     f1(p, 'uSpin', b.spin);
-    f1(p, 'uKerr', bh.kerr ? 1 : 0);
+    // Disk flow clock in float64 (exact at any simulation speed) and the R_g / c that pass per frame (~60 fps),
+    // so the shader can fade fast-moving azimuthal structure into smooth rings instead of strobing.
+    const rgSec = b.rgM / C_LIGHT;
+    const flowRg = fc.simTime / rgSec;
+    f1(p, 'uFlowPhase', (((flowRg / BH_FLOW_CYCLE_RG) % 1) + 1) % 1);
+    f1(p, 'uFlowRate', fc.paused ? 0 : Math.abs(fc.simSpeed) / (60 * rgSec));
     f1(p, 'uBoundRg', boundRg);
     f1(p, 'uDiskInnerRg', disk?.innerRg ?? 0);
     f1(p, 'uDiskOuterRg', outerRg);
