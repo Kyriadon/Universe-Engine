@@ -1,5 +1,17 @@
 /**
- * physics.ts: accretion-disk PLASMA for the blackhole shader (see the PLASMA contract in graphics/shaders.ts).
+ * physics.ts: GRAVITY, and the accretion-disk PLASMA for the blackhole shader (see the PLASMA contract in graphics/shaders.ts).
+ *
+ * GRAVITY (first half of this file)
+ *   Every mass in the scene is a GravitySource (position, GM, horizon radius); a black hole is built from its data with
+ *   blackHoleSource(position, rgM). Gravity pulls on EVERYTHING that is a DynamicBody (position, velocity, captured):
+ *   the camera/you (graphics/gl.ts calls gravity.step() on it every frame with the simulation time that passed), and any
+ *   probe, planet or particle you add. The law is the pseudo-Newtonian (Paczynski-Wiita) potential, a = GM / (r - r_s)^2
+ *   with r_s = 2GM/c^2: it is Newtonian far away, puts the innermost stable orbit at 6GM/c^2 and the horizon at r_s, which
+ *   is exactly the Schwarzschild geometry the blackhole shader traces. Integration is symplectic leapfrog with adaptive
+ *   sub-steps (a fraction of the local free-fall time), so orbits stay stable at any simulation speed. A body that reaches
+ *   a horizon is captured and stops. The plasma below orbits with the same law (keplerOmegaRg).
+ *
+ * PLASMA (second half)
  *
  * Writes ONE RGBA16F texture, mipmapped, LINEAR, wrap S = CLAMP_TO_EDGE, wrap T = REPEAT:
  *   u = ln(r / rIn) / ln(rOut / rIn)      r in gravitational radii (R_g), rIn = innerRg or iscoRadiusRg(spin)
@@ -20,7 +32,180 @@
  *                age = timeRg - plasma.shownTime;             // -> the shader's uPlasmaAge
  * A finished build is swapped in whole (double buffered), so the GPU never sees a half-built texture.
  */
+import { CELL_SIZE_M, Tier, deltaInto, toTier, translate, type WorldPos } from '../packages/core/src/coords';
 import { iscoRadiusRg } from '../graphics/shaders';
+
+
+// ---------------------------------------------------------------------------------------------
+// GRAVITY
+// ---------------------------------------------------------------------------------------------
+
+/** Speed of light in m/s (exact by definition). */
+export const SPEED_OF_LIGHT = 299_792_458;
+
+/** A mass that pulls on every DynamicBody. */
+export interface GravitySource {
+  readonly position: WorldPos;
+  /** G*M in m^3/s^2. */
+  readonly gm: number;
+  /** Radius in metres inside which nothing returns (2GM/c^2 for a black hole). 0 for an ordinary body: no capture. */
+  readonly horizonM: number;
+}
+
+/** Anything that moves under gravity. step() writes the new position and velocity back into it. */
+export interface DynamicBody {
+  position: WorldPos;
+  /** m/s along the world axes. */
+  velocity: [number, number, number];
+  /** True once a horizon has swallowed it; a captured body no longer moves. */
+  captured: boolean;
+}
+
+/** What graphics/gl.ts needs from gravity: advance one body by dtSeconds of simulation time. */
+export interface GravityModel {
+  step(body: DynamicBody, dtSeconds: number): void;
+}
+
+/** The pull of a black hole, built from its data: GM = R_g c^2 and the horizon at 2 R_g (what the shader traces). */
+export function blackHoleSource(position: WorldPos, rgM: number): GravitySource {
+  return { position, gm: rgM * SPEED_OF_LIGHT * SPEED_OF_LIGHT, horizonM: 2 * rgM };
+}
+
+/**
+ * Angular velocity of a prograde circular orbit at radius rRg, in units of c / R_g (the Bardeen-Press-Teukolsky Kerr
+ * value, 1 / (r^1.5 + a)). The plasma disk and the shader's disk both use it, so the disk orbits by the same gravity.
+ */
+export function keplerOmegaRg(rRg: number, spin: number): number {
+  return 1 / (Math.pow(rRg, 1.5) + spin);
+}
+
+/** Each sub-step covers this fraction of the local free-fall time (and of the distance to the nearest horizon). */
+const STEP_FRACTION = 0.02;
+/** Sub-steps per call. A call that would need more skips the rest of its time instead of freezing the frame. */
+const MAX_SUBSTEPS = 256;
+/** Bodies never reach c: speeds are clamped to this fraction of it. */
+const MAX_SPEED_OVER_C = 0.9999;
+/** Floor for the speed in the distance-based step limit, so a body at rest does not divide by zero. */
+const MIN_SPEED_MS = 1e-9;
+
+/** Finest tier whose cell is at least `meters` wide, so a displacement of that size keeps the offsets small. */
+function tierForDistance(meters: number): Tier {
+  for (let t: number = Tier.Surface; t > Tier.Universe; t--) {
+    if ((CELL_SIZE_M[t] as number) >= meters) return t as Tier;
+  }
+  return Tier.Universe;
+}
+
+export class Gravity implements GravityModel {
+  private readonly sources: readonly GravitySource[];
+  private readonly delta = new Float64Array(3);
+  private readonly acc = new Float64Array(3);
+  /** Set by accelerationInto: the smallest free-fall time and the smallest gap to a horizon among the sources. */
+  private fallTimeS = Infinity;
+  private gapM = Infinity;
+
+  constructor(sources: readonly GravitySource[]) {
+    for (const s of sources) {
+      if (!(s.gm > 0) || !(s.horizonM >= 0)) {
+        throw new RangeError('Gravity: every source needs gm > 0 and horizonM >= 0');
+      }
+    }
+    this.sources = sources;
+  }
+
+  /**
+   * Writes the acceleration (m/s^2) at `at` into out[0..2]. Returns the index of the source whose horizon contains
+   * `at`, or -1. Anything can use it: planets, probes, particles, the camera.
+   */
+  accelerationInto(out: Float64Array | number[], at: WorldPos): number {
+    out[0] = 0;
+    out[1] = 0;
+    out[2] = 0;
+    this.fallTimeS = Infinity;
+    this.gapM = Infinity;
+    for (let i = 0; i < this.sources.length; i++) {
+      const s = this.sources[i] as GravitySource;
+      deltaInto(this.delta, 0, s.position, at); // from the body towards the source
+      const dx = this.delta[0] as number;
+      const dy = this.delta[1] as number;
+      const dz = this.delta[2] as number;
+      const r = Math.hypot(dx, dy, dz);
+      const gap = r - s.horizonM;
+      if (s.horizonM > 0 && gap <= 0) return i;
+      if (!(r > 0)) continue; // exactly on an ordinary body: no direction to pull in
+      const k = s.gm / (gap * gap * r);
+      out[0] = (out[0] as number) + dx * k;
+      out[1] = (out[1] as number) + dy * k;
+      out[2] = (out[2] as number) + dz * k;
+      this.fallTimeS = Math.min(this.fallTimeS, Math.sqrt((gap * gap * gap) / s.gm));
+      this.gapM = Math.min(this.gapM, gap);
+    }
+    return -1;
+  }
+
+  /** Advance one body by dtSeconds of simulation time (kick-drift-kick leapfrog, adaptive sub-steps). */
+  step(body: DynamicBody, dtSeconds: number): void {
+    if (body.captured || !(dtSeconds > 0) || this.sources.length === 0) return;
+    const v = body.velocity;
+    const vMax = SPEED_OF_LIGHT * MAX_SPEED_OVER_C;
+    const clampSpeed = (): void => {
+      const sp = Math.hypot(v[0], v[1], v[2]);
+      if (sp > vMax) {
+        const f = vMax / sp;
+        v[0] *= f;
+        v[1] *= f;
+        v[2] *= f;
+      }
+    };
+
+    let pos = body.position;
+    let remaining = dtSeconds;
+    let hit = this.accelerationInto(this.acc, pos);
+    for (let n = 0; n < MAX_SUBSTEPS && remaining > 0 && hit < 0; n++) {
+      const speed = Math.hypot(v[0], v[1], v[2]);
+      const h = Math.min(remaining, STEP_FRACTION * Math.min(this.fallTimeS, this.gapM / Math.max(speed, MIN_SPEED_MS)));
+      if (!(h > 0)) break;
+
+      v[0] += (this.acc[0] as number) * h * 0.5;
+      v[1] += (this.acc[1] as number) * h * 0.5;
+      v[2] += (this.acc[2] as number) * h * 0.5;
+      clampSpeed();
+
+      const dx = v[0] * h;
+      const dy = v[1] * h;
+      const dz = v[2] * h;
+      const tier = tierForDistance(Math.hypot(dx, dy, dz));
+      if (pos.tier !== tier) pos = toTier(pos, tier);
+      pos = translate(pos, [dx, dy, dz]);
+
+      hit = this.accelerationInto(this.acc, pos);
+      if (hit < 0) {
+        v[0] += (this.acc[0] as number) * h * 0.5;
+        v[1] += (this.acc[1] as number) * h * 0.5;
+        v[2] += (this.acc[2] as number) * h * 0.5;
+        clampSpeed();
+      }
+      remaining -= h;
+    }
+
+    body.position = pos;
+    if (hit >= 0) {
+      body.captured = true;
+      v[0] = 0;
+      v[1] = 0;
+      v[2] = 0;
+    }
+  }
+
+  /** Advance every body (planets, probes, particles, you) by the same simulation time. */
+  stepAll(bodies: Iterable<DynamicBody>, dtSeconds: number): void {
+    for (const b of bodies) this.step(b, dtSeconds);
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// PLASMA
+// ---------------------------------------------------------------------------------------------
 
 const TAU = Math.PI * 2;
 /** Shear is bounded by cross-fading two phases of this length (R_g/c): keeps structure resolvable in the texture. */
@@ -35,7 +220,9 @@ const REBUILD_STEP_RG = 3;
 /** Turbulence: feature size in azimuth (cycles per radian-ish, larger = finer), in ln(r), and the density contrast. */
 const STREAK_PHI = 2.5;
 const STREAK_R = 7;
-const DENSITY_CONTRAST = 1.1;
+const DENSITY_CONTRAST = 0.6;
+/** Temperature fluctuation amplitude (fraction of the local temperature). Brightness goes as T^4, so this must stay small. */
+const TEMPERATURE_NOISE = 0.08;
 
 export interface PlasmaOptions {
   /** Dimensionless spin a/M, 0..0.998 (sets the ISCO and Keplerian rate). */
@@ -227,7 +414,7 @@ export class PlasmaDisk {
   }
 
   private omega(r: number): number {
-    return 1 / (Math.pow(r, 1.5) + this.spin);
+    return keplerOmegaRg(r, this.spin);
   }
 
   /** Freeze the inputs for the current time (flow phase, hot spots) and start a build into the back buffer. */
@@ -330,7 +517,7 @@ export class PlasmaDisk {
       const armShock = Math.max(data[o + 1]!, 0);
       const tn = data[o + 3]!;
       // Brightness goes as temperature^4, so the temperature has to stay close to 1 or the disk turns blotchy.
-      const temp = 1 + 0.12 * Math.tanh(0.7 * Math.log(rho)) + 0.08 * armShock + 0.25 * tn;
+      const temp = 1 + 0.12 * Math.tanh(0.7 * Math.log(rho)) + 0.08 * armShock + TEMPERATURE_NOISE * tn;
       data[o] = rho;
       data[o + 1] = Math.min(Math.max(temp, 0.7), 1.5);
       data[o + 3] = 1;
