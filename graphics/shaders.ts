@@ -14,8 +14,8 @@
  *  - Closest-approach math (s = t - tc) keeps float32 exact even when a body is 1e20 m away.
  *  - Draw far to near: background, cosmicWeb, galaxy, nebula, stars, pulsar, blackhole, planet, rings,
  *    clouds, atmosphere, aurora, then bloomDown/bloomUp, tonemap.
- *  - blackhole reads uSceneColor and writes a full frame: ping-pong two HDR targets.
- *  - Black hole lensing is Schwarzschild; spin only moves the ISCO and Doppler (honest approximation).
+ *  - blackhole reads uSceneColor (needs mipmaps) + uHistory and writes a full frame: ping-pong HDR targets.
+ *  - Black hole: Kerr geodesics (uKerr=1) or fast Schwarzschild; disk kinematics are approximate.
  */
 
 export type ShaderName =
@@ -323,17 +323,25 @@ void main() {
 }`);
 
 // ---------------------------------------------------------------------------------------------
-// blackhole: also gravastars and neutron stars (uSurfaceRg > 2). Reads uSceneColor, writes a full frame.
-// Uniforms: uCenter (m), uRg (GM/c^2, m), uSpinAxis, uSpin (0..0.998), uBoundRg, uDiskInnerRg (<=0 -> ISCO),
+// blackhole: black holes, gravastars and neutron stars (uSurfaceRg > 2). Reads uSceneColor, writes a full frame.
+//  - uKerr = 1: Kerr null geodesics (Kerr-Schild Hamiltonian, RK2, spin axis = uSpinAxis). uKerr = 0: fast
+//    Schwarzschild bending. Disk kinematics (Doppler/redshift) use Kerr Omega but approximate lapse.
+//  - Bipolar relativistic jets (uJetGain > 0), Doppler-boosted (delta^3), along +/- spin axis.
+//  - Shear-limited disk turbulence (flow-map, distance-faded) -> no sub-pixel dust.
+//  - Mip/anisotropic-filtered lensing: uSceneColor MUST have mipmaps (LINEAR_MIPMAP_LINEAR, generateMipmap).
+//  - Supersampling (uSamples 1..8, jittered) + temporal smoothing (uHistory = previous output of this pass,
+//    rotation-reprojected, colour-clamped). Set uHistoryValid = 0 after a camera teleport / large move.
+// Uniforms: uCenter (m), uRg (GM/c^2, m), uSpinAxis, uSpin (0..0.998), uKerr, uBoundRg, uDiskInnerRg (<=0 -> ISCO),
 // uDiskOuterRg, uDiskHeight (H/r), uDiskTemperature (peak K), uDiskOpacity, uDiskGain, uSurfaceRg,
-// uSurfaceTemperature, uMaxSteps (<= 320), uFallback (pre-exposed colour where the ray leaves the screen).
-// Light bending: Binet-equivalent central force a = -3 h^2 r / r^5 (M = 1), velocity Verlet.
+// uSurfaceTemperature, uMaxSteps (<=320), uFallback, uJetGain, uJetLengthRg, uJetWidth (Rg), uSamples, uJitter (px),
+// uMaxFootprint (px, ~16), uTemporalBlend (0..0.95), uHistoryValid, uPrevCamRight/Up/Forward, uPrevTanHalfFov.
 // ---------------------------------------------------------------------------------------------
 const BLACKHOLE_FS = glsl(FRAG, MATH, NOISE, COLOR, CAMERA, `
 uniform vec3 uCenter;
 uniform float uRg;
 uniform vec3 uSpinAxis;
 uniform float uSpin;
+uniform float uKerr;
 uniform float uBoundRg;
 uniform float uDiskInnerRg;
 uniform float uDiskOuterRg;
@@ -345,7 +353,20 @@ uniform float uSurfaceRg;
 uniform float uSurfaceTemperature;
 uniform int uMaxSteps;
 uniform vec3 uFallback;
+uniform float uJetGain;
+uniform float uJetLengthRg;
+uniform float uJetWidth;
+uniform int uSamples;
+uniform vec2 uJitter;
+uniform float uMaxFootprint;
+uniform float uTemporalBlend;
+uniform float uHistoryValid;
+uniform vec3 uPrevCamRight;
+uniform vec3 uPrevCamUp;
+uniform vec3 uPrevCamForward;
+uniform vec2 uPrevTanHalfFov;
 uniform sampler2D uSceneColor;
+uniform sampler2D uHistory;
 out vec4 fragColor;
 
 float iscoRadius(float a) {
@@ -363,114 +384,236 @@ vec3 bhAccel(vec3 p, float h2) {
   float r2 = dot(p, p);
   return (-3.0 * h2 / (r2 * r2 * sqrt(r2))) * p;
 }
-vec3 sampleScene(vec3 dir) {
-  float z = dot(dir, uCamForward);
-  if (z > 1e-4) {
-    vec2 ndc = vec2(dot(dir, uCamRight) / (z * uTanHalfFov.x), dot(dir, uCamUp) / (z * uTanHalfFov.y));
-    if (abs(ndc.x) < 1.0 && abs(ndc.y) < 1.0) return textureLod(uSceneColor, ndc * 0.5 + 0.5, 0.0).rgb;
-  }
-  return uFallback;
+vec2 rot2(vec2 v, float a) {
+  float c = cos(a), s = sin(a);
+  return vec2(c * v.x + s * v.y, -s * v.x + c * v.y);
 }
-void main() {
-  vec3 scene = texelFetch(uSceneColor, ivec2(gl_FragCoord.xy), 0).rgb;
-  vec3 rd = viewRay(gl_FragCoord.xy);
-  vec3 ro = -uCenter / uRg;
-  float tc = -dot(ro, rd);
-  vec3 m = ro + rd * tc;
-  float b = safeLength(m);
-  vec3 toC = b > 0.0 ? -m / b : vec3(0.0);
-  if (b > 4.0e4) { fragColor = vec4(hdrClamp(scene), 1.0); return; }
-  float rb = uBoundRg;
-  bool inside = safeLength(ro) < rb;
-  float h = b < rb ? sqrt(rb * rb - b * b) : 0.0;
-  bool hits = inside || (b < rb && tc - h > 0.0);
-  if (!hits) {
-    float al = 2.0 / b * omf(b, -tc);
-    fragColor = vec4(hdrClamp(sampleScene(normalize(rd + toC * al))), 1.0);
-    return;
-  }
-  vec3 p = ro;
-  vec3 v = rd;
-  if (!inside) {
-    float sIn = -h;
-    float al = 2.0 / b * (omf(b, -tc) - omf(b, sIn));
-    v = normalize(rd + toC * al);
-    p = m + rd * sIn;
-  }
+
+// ---- Kerr (Kerr-Schild Cartesian, M = 1, spin along +z). Forward null rays in Kerr(-a) = backward rays in Kerr(a).
+float kerrR(vec3 x, float a) {
+  float a2 = a * a;
+  float t = dot(x, x) - a2;
+  return sqrt(max(0.5 * (t + sqrt(t * t + 4.0 * a2 * x.z * x.z)), 1e-6));
+}
+void kerrGeom(vec3 x, float a, out float f, out vec3 l) {
+  float a2 = a * a;
+  float r = kerrR(x, a);
+  float r2 = r * r;
+  f = 2.0 * r2 * r / (r2 * r2 + a2 * x.z * x.z);
+  float d = r2 + a2;
+  l = vec3((r * x.x + a * x.y) / d, (r * x.y - a * x.x) / d, x.z / r);
+}
+float kerrH(vec3 x, vec3 p, float a) {
+  float f;
+  vec3 l;
+  kerrGeom(x, a, f, l);
+  float k = 1.0 + dot(l, p);
+  return 0.5 * (dot(p, p) - 1.0 - f * k * k);
+}
+void kerrDeriv(vec3 x, vec3 p, float a, out vec3 dx, out vec3 dp) {
+  float f;
+  vec3 l;
+  kerrGeom(x, a, f, l);
+  float k = 1.0 + dot(l, p);
+  dx = p - f * k * l;
+  float e = 0.01 * max(length(x), 1.0);
+  float H0 = 0.5 * (dot(p, p) - 1.0 - f * k * k);
+  dp = -vec3(kerrH(x + vec3(e, 0.0, 0.0), p, a) - H0,
+             kerrH(x + vec3(0.0, e, 0.0), p, a) - H0,
+             kerrH(x + vec3(0.0, 0.0, e), p, a) - H0) / e;
+}
+
+vec3 trace(vec2 fc) {
   vec3 n = normalize(uSpinAxis);
   vec3 e1 = normalize(abs(n.y) < 0.99 ? cross(n, vec3(0.0, 1.0, 0.0)) : cross(n, vec3(1.0, 0.0, 0.0)));
   vec3 e2 = cross(n, e1);
-  vec3 hv = cross(p, v);
-  float h2 = dot(hv, hv);
-  float rIn = uDiskInnerRg > 0.0 ? uDiskInnerRg : iscoRadius(uSpin);
-  float rOut = max(uDiskOuterRg, rIn * 1.5);
-  float tRg = uTime * C_LIGHT / uRg;
+  vec3 rdW = viewRay(fc);
+  vec3 roW = -uCenter / uRg;
+  vec3 rd = vec3(dot(rdW, e1), dot(rdW, e2), dot(rdW, n));
+  vec3 ro = vec3(dot(roW, e1), dot(roW, e2), dot(roW, n));
+  float tc = -dot(ro, rd);
+  vec3 m = ro + rd * tc;
+  float b = safeLength(m);
+  vec3 toC = b > 1e-4 ? -m / b : vec3(0.0);
+  float rb = max(uBoundRg, uJetGain > 0.0 ? uJetLengthRg * 1.05 : 0.0);
+  bool inside = safeLength(ro) < rb;
+  float h = b < rb ? sqrt(rb * rb - b * b) : 0.0;
+  bool hits = b < 4.0e4 && (inside || (b < rb && tc - h > 0.0));
+  float a = clamp(uSpin, 0.0, 0.998);
+  float rPlus = 1.0 + sqrt(1.0 - a * a);
+  bool kerr = uKerr > 0.5;
+
   vec3 acc = vec3(0.0);
   float trans = 1.0;
   int fate = 0;
-  for (int i = 0; i < 320; i++) {
-    if (i >= uMaxSteps) break;
-    float r = length(p);
-    if (uSurfaceRg > 0.0 && r < uSurfaceRg) { fate = 2; break; }
-    if (r < 2.0) { fate = 1; break; }
-    if (r > rb && dot(p, v) > 0.0) { fate = 3; break; }
-    float ell = clamp(0.04 * r, 0.015, 6.0);
-    float y = dot(p, n);
-    float hh = max(uDiskHeight, 0.03) * r;
-    if (r < rOut * 1.1 && abs(y) < 4.0 * hh + 0.2) ell = min(ell, 0.3 * hh + 0.03);
-    vec3 pp = p - n * y;
-    float rc = length(pp);
-    if (rc > rIn && rc < rOut) {
-      float hz = max(uDiskHeight, 0.03) * rc;
-      float vert = exp(-0.5 * y * y / (hz * hz));
-      if (vert > 0.02) {
-        float x = rc / rIn;
-        float prof = 2.05 * pow(x, -0.75) * pow(max(1.0 - inversesqrt(x), 0.0), 0.25);
-        float Te = uDiskTemperature * prof;
-        vec3 vn = normalize(v);
-        vec3 phiDir = normalize(cross(n, pp));
-        float beta = min(inversesqrt(max(rc - 2.0, 0.08)), 0.92);
-        float gam = inversesqrt(1.0 - beta * beta);
-        float dopp = 1.0 / (gam * (1.0 + beta * dot(phiDir, vn)));
-        float g = dopp * sqrt(max(1.0 - 2.0 / r, 0.0));
-        float To = g * Te;
-        vec2 xy = vec2(dot(pp, e1), dot(pp, e2));
-        float ang = mod(pow(rc, -1.5) * tRg, TAU);
-        float cs = cos(ang), sn = sin(ang);
-        vec2 q = vec2(cs * xy.x + sn * xy.y, -sn * xy.x + cs * xy.y);
-        float turb = 0.35 + 1.3 * fbm(vec3(q * 0.45, y * 0.8), 3);
-        float dtau = uDiskOpacity * vert * turb * sqrt(rIn / rc) * ell;
-        vec3 S = blackbodyColor(To) * blackbodyRadiance(To) * uDiskGain;
-        float a = 1.0 - exp(-dtau);
-        acc += trans * S * a;
-        trans *= 1.0 - a;
-        if (trans < 0.01) { fate = 4; break; }
+  vec3 p = ro;
+  vec3 v = rd;
+  vec3 dirOut = rd;
+  vec3 surf = vec3(0.0);
+
+  if (!hits) {
+    if (b > 1e-4 && b < 4.0e4) dirOut = normalize(rd + toC * (2.0 / b * omf(b, -tc)));
+  } else {
+    if (!inside) {
+      v = normalize(rd + toC * (2.0 / b * (omf(b, -tc) - omf(b, -h))));
+      p = m - rd * h;
+    }
+    vec3 hv = cross(p, v);
+    float h2 = dot(hv, hv);
+    vec3 pm = vec3(0.0);
+    if (kerr) {
+      float f;
+      vec3 l;
+      kerrGeom(p, -a, f, l);
+      float c = dot(l, v);
+      float A = max(1.0 - f * c * c, 1e-3);
+      pm = ((f * c + sqrt(f * f * c * c + A * (1.0 + f))) / A) * v;
+    }
+    float rIn = uDiskInnerRg > 0.0 ? uDiskInnerRg : iscoRadius(a);
+    float rOut = max(uDiskOuterRg, rIn * 1.5);
+    float tw = mod(uTime * C_LIGHT / uRg, 4000.0);
+    float ph = fract(tw / 100.0);
+    float pxAng = 2.0 * uTanHalfFov.y / uResolution.y;
+    float jetLen = uJetLengthRg;
+
+    for (int i = 0; i < 320; i++) {
+      if (i >= uMaxSteps) break;
+      float r = length(p);
+      float rk = kerr ? kerrR(p, a) : r;
+      if (uSurfaceRg > 0.0 && r < uSurfaceRg) { fate = 2; break; }
+      if (rk < (kerr ? rPlus * 1.01 : 2.0)) { fate = 1; break; }
+      if (r > rb && dot(p, v) > 0.0) { fate = 3; break; }
+      float ell = clamp(0.04 * r, 0.015, 6.0);
+      if (kerr) ell = min(ell, 0.15 * (rk - rPlus) + 0.02);
+      vec3 vn = normalize(v);
+      float z = p.z;
+      float rc = length(p.xy);
+      float hh = max(uDiskHeight, 0.03) * rc;
+      if (r < rOut * 1.1 && abs(z) < 4.0 * hh + 0.2) ell = min(ell, 0.3 * hh + 0.03);
+
+      if (uJetGain > 0.0) {
+        float az = abs(z);
+        float w = uJetWidth + 0.08 * az;
+        if (az > 2.5 && az < jetLen && rc < 3.0 * w) {
+          ell = min(ell, 0.5 + 0.05 * az);
+          float dens = exp(-(rc * rc) / (w * w)) * pow(az, -1.2);
+          dens *= 0.6 + 0.8 * noise3(vec3(p.xy * 0.3, az * 0.25 - tw * 0.02));
+          const float bj = 0.9;
+          float gj = inversesqrt(1.0 - bj * bj);
+          float dl = 1.0 / (gj * (1.0 + bj * sign(z) * vn.z));
+          acc += trans * vec3(0.45, 0.65, 1.0) * uJetGain * dens * dl * dl * dl * ell;
+        }
+      }
+
+      if (rc > rIn && rc < rOut) {
+        float hz = max(uDiskHeight, 0.03) * rc;
+        float vert = exp(-0.5 * z * z / (hz * hz));
+        if (vert > 0.02) {
+          float x = rc / rIn;
+          float prof = 2.05 * pow(x, -0.75) * pow(max(1.0 - inversesqrt(x), 0.0), 0.25);
+          float Te = uDiskTemperature * prof;
+          vec3 phiDir = normalize(vec3(-p.y, p.x, 0.0));
+          float om = 1.0 / (pow(rc, 1.5) + a);
+          float beta = min(om * rc * inversesqrt(max(1.0 - 2.0 / rc, 0.05)), 0.92);
+          float gam = inversesqrt(1.0 - beta * beta);
+          float dopp = 1.0 / (gam * (1.0 + beta * dot(phiDir, vn)));
+          float g = dopp * sqrt(max(1.0 - 2.0 / r, 0.0));
+          float To = g * Te;
+          // shear-limited flow-map turbulence, faded when finer than a pixel
+          float wv = 0.03 * pow(rc / 10.0, -0.5);
+          float a0 = wv * 100.0 * ph;
+          float a1 = wv * 100.0 * (ph - 1.0);
+          float n0 = fbm(vec3(rot2(p.xy, a0) * 0.45, z * 0.8), 3);
+          float n1 = fbm(vec3(rot2(p.xy, a1) * 0.45, z * 0.8), 3);
+          float turb = 0.6 + 0.9 * mix(n0, n1, ph);
+          float pxSize = length(p - ro) * pxAng;
+          turb = mix(1.0, turb, 1.0 - smoothstep(0.3, 1.0, pxSize * 1.35));
+          float dtau = uDiskOpacity * vert * turb * sqrt(rIn / rc) * ell;
+          vec3 S = blackbodyColor(To) * blackbodyRadiance(To) * uDiskGain;
+          float al = 1.0 - exp(-dtau);
+          acc += trans * S * al;
+          trans *= 1.0 - al;
+          if (trans < 0.01) { fate = 4; break; }
+        }
+      }
+
+      if (kerr) {
+        vec3 dx1, dp1, dx2, dp2;
+        kerrDeriv(p, pm, -a, dx1, dp1);
+        float dt = ell / max(length(dx1), 1e-3);
+        kerrDeriv(p + 0.5 * dt * dx1, pm + 0.5 * dt * dp1, -a, dx2, dp2);
+        p += dt * dx2;
+        pm += dt * dp2;
+        v = dx2;
+      } else {
+        float dt = ell / max(length(v), 1e-4);
+        vec3 a0v = bhAccel(p, h2);
+        p += v * dt + 0.5 * a0v * dt * dt;
+        vec3 a1v = bhAccel(p, h2);
+        v += 0.5 * (a0v + a1v) * dt;
       }
     }
-    float dt = ell / max(length(v), 1e-4);
-    vec3 a0 = bhAccel(p, h2);
-    p += v * dt + 0.5 * a0 * dt * dt;
-    vec3 a1 = bhAccel(p, h2);
-    v += 0.5 * (a0 + a1) * dt;
-  }
-  vec3 bg = vec3(0.0);
-  if (fate == 2) {
+
     vec3 vn = normalize(v);
-    float To = uSurfaceTemperature * sqrt(max(1.0 - 2.0 / uSurfaceRg, 0.0));
-    float limb = 0.4 + 0.6 * max(dot(normalize(p), -vn), 0.0);
-    bg = blackbodyColor(To) * blackbodyRadiance(To) * uDiskGain * limb * uExposure;
-  } else if (fate == 0 || fate == 3) {
-    vec3 vn = normalize(v);
-    float s = dot(p, vn);
-    vec3 perp = p - vn * s;
-    float bp = safeLength(perp);
-    if (fate == 3 && bp > 1e-3) {
-      float al = 2.0 / bp * omf(bp, s);
-      vn = normalize(vn - (perp / bp) * al);
+    if (fate == 2) {
+      float To = uSurfaceTemperature * sqrt(max(1.0 - 2.0 / uSurfaceRg, 0.0));
+      float limb = 0.4 + 0.6 * max(dot(normalize(p), -vn), 0.0);
+      surf = blackbodyColor(To) * blackbodyRadiance(To) * uDiskGain * limb * uExposure;
     }
-    bg = sampleScene(vn);
+    if (fate == 0 || fate == 3) {
+      float s = dot(p, vn);
+      vec3 perp = p - vn * s;
+      float bp = safeLength(perp);
+      if (fate == 3 && bp > 1e-3) vn = normalize(vn - (perp / bp) * (2.0 / bp * omf(bp, s)));
+      dirOut = vn;
+    }
   }
-  fragColor = vec4(hdrClamp(acc * uExposure + trans * bg), 1.0);
+
+  vec3 dirW = dirOut.x * e1 + dirOut.y * e2 + dirOut.z * n;
+  float zc = dot(dirW, uCamForward);
+  vec2 uv = zc > 1e-4
+    ? vec2(dot(dirW, uCamRight) / (zc * uTanHalfFov.x), dot(dirW, uCamUp) / (zc * uTanHalfFov.y)) * 0.5 + 0.5
+    : vec2(-1.0);
+  vec2 g1 = dFdx(uv);
+  vec2 g2 = dFdy(uv);
+  float fp = max(length(g1 * uResolution), length(g2 * uResolution));
+  float sc = min(1.0, uMaxFootprint / max(fp, 1e-6));
+  vec3 sceneC = textureGrad(uSceneColor, uv, g1 * sc, g2 * sc).rgb;
+  bool onScreen = all(greaterThan(uv, vec2(0.0))) && all(lessThan(uv, vec2(1.0)));
+  vec3 bg = onScreen ? sceneC : uFallback;
+  if (fate == 1 || fate == 4) bg = vec3(0.0);
+  if (fate == 2) bg = surf;
+  return hdrClamp(acc * uExposure + trans * bg);
+}
+
+void main() {
+  int ns = clamp(uSamples, 1, 8);
+  vec3 sum = vec3(0.0);
+  vec3 cmin = vec3(1.0e30);
+  vec3 cmax = vec3(0.0);
+  for (int i = 0; i < 8; i++) {
+    if (i >= ns) break;
+    vec2 o = ns > 1 ? fract(vec2(0.5) + float(i) * vec2(0.7548776662, 0.5698402910)) - 0.5 : vec2(0.0);
+    vec3 c = trace(gl_FragCoord.xy + o + uJitter);
+    sum += c;
+    cmin = min(cmin, c);
+    cmax = max(cmax, c);
+  }
+  vec3 col = sum / float(ns);
+  if (uTemporalBlend > 0.0 && uHistoryValid > 0.5) {
+    vec3 rd0 = viewRay(gl_FragCoord.xy);
+    float z = dot(rd0, uPrevCamForward);
+    if (z > 1e-4) {
+      vec2 ndc = vec2(dot(rd0, uPrevCamRight) / (z * uPrevTanHalfFov.x), dot(rd0, uPrevCamUp) / (z * uPrevTanHalfFov.y));
+      if (abs(ndc.x) < 1.0 && abs(ndc.y) < 1.0) {
+        vec3 hist = textureLod(uHistory, ndc * 0.5 + 0.5, 0.0).rgb;
+        vec3 lo = min(cmin, col * 0.5);
+        vec3 hi = max(cmax, col * 2.0 + 1e-4);
+        col = mix(col, clamp(hist, lo, hi), uTemporalBlend);
+      }
+    }
+  }
+  fragColor = vec4(hdrClamp(col), 1.0);
 }`);
 
 // ---------------------------------------------------------------------------------------------
