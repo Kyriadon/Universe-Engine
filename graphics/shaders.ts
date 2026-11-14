@@ -268,20 +268,18 @@ vec4 shellSegmentsS(vec3 ro, float tc, vec3 m, float rIn, float rOut) {
 }`;
 
 // ---------------------------------------------------------------------------------------------
-// background: CMB + anisotropy. Uniforms: uCmbTemperature (2.725), uCmbBrightness, uCmbContrast.
-// (The real CMB is invisible; brightness/contrast are artistic gains.)
+// background: the CMB as one uniform blackbody and nothing else. No noise, no procedural stars or sky patterns:
+// the real CMB is invisible, so every visible sky object must come from scene data (star fields, galaxies...).
+// Uniforms: uCmbTemperature (2.725), uCmbBrightness (artistic gain, 0 draws pure black). uCmbContrast stays declared
+// because renderer.ts sets it (every name it sets is checked against the GLSL), but the sky has no anisotropy to scale.
 // ---------------------------------------------------------------------------------------------
-const BACKGROUND_FS = glsl(FRAG, MATH, NOISE, CAMERA, `
+const BACKGROUND_FS = glsl(FRAG, MATH, CAMERA, `
 uniform float uCmbTemperature;
 uniform float uCmbBrightness;
 uniform float uCmbContrast;
 out vec4 fragColor;
 void main() {
-  vec3 rd = viewRay(gl_FragCoord.xy);
-  float a = fbm(rd * 2.5 + 3.1, 5) - 0.5;
-  float b = fbm(rd * 9.0 + 11.7, 4) - 0.5;
-  float T = uCmbTemperature * (1.0 + uCmbContrast * (a + 0.35 * b));
-  float radiance = (SIGMA_SB * T * T) * (T * T) / PI;
+  float radiance = (SIGMA_SB * uCmbTemperature * uCmbTemperature) * (uCmbTemperature * uCmbTemperature) / PI;
   fragColor = hdrOut(vec3(0.62, 0.72, 1.0) * radiance * uCmbBrightness, 1.0);
 }`);
 
@@ -415,6 +413,9 @@ out vec4 fragColor;
 const float FLOW_CYCLE = 60.0;
 const float B_CRIT = 5.196152;
 const float HALF_PI = 1.5707963;
+// Strength of the fine turbulence filaments in the disk (exponent on the zero-mean noise). Real disk turbulence is a
+// subtle modulation of the emission; strong values read as concentric record-groove rings.
+const float RING_CONTRAST = 0.8;
 
 float iscoRadius(float a) {
   a = clamp(a, 0.0, 0.998);
@@ -487,7 +488,7 @@ vec4 shadeDisk(vec2 hp, vec3 vd, vec2 dx, vec2 dy, float rIn, float rOut) {
   float s = w0 * ringNoise(ang - om * FLOW_CYCLE * ph, lnr, rc, fr, wAz)
           + w1 * ringNoise(ang - om * FLOW_CYCLE * (ph - 1.0), lnr, rc, fr, wAz);
   s *= inversesqrt(w0 * w0 + w1 * w1);
-  float tex = exp(2.0 * s);
+  float tex = exp(RING_CONTRAST * s);
 
   // PLASMA from physics.ts: R density, G temperature, B flares. Its azimuthal structure fades with the motion per frame.
   vec4 pl = vec4(1.0, 1.0, 0.0, 1.0);
@@ -503,9 +504,12 @@ vec4 shadeDisk(vec2 hp, vec3 vd, vec2 dx, vec2 dy, float rIn, float rOut) {
   tex *= pow(max(pl.r, 0.05), 0.7);
 
   float tp = prof * pl.g;
-  float I = pow(tp, 3.0) * pow(g, 3.0);
+  // Bolometric intensity: emitted I ~ T^4 and the observed intensity scales with g^4 (Liouville), so the disk falls off
+  // steeply from the white-hot inner edge and the side moving towards us is much brighter than the receding side.
+  // The observed colour temperature is the emitted one times g, so the bright side is also the whiter side.
+  float I = pow(tp, 4.0) * pow(g, 4.0);
   float tmax = min(uDiskVisTemp > 0.0 ? uDiskVisTemp : 5600.0, 5600.0);
-  float Tcol = 1700.0 + (tmax - 1700.0) * pow(clamp(tp * sqrt(g) / 1.15, 0.0, 1.0), 1.2);
+  float Tcol = 1700.0 + (tmax - 1700.0) * pow(clamp(tp * g / 1.15, 0.0, 1.0), 1.2);
   vec3 S = blackbodyColor(Tcol) * blackbodyRadiance(uDiskTemperature) * I * tex * uDiskGain * 0.6;
   S += blackbodyColor(min(Tcol * 1.3, 9000.0)) * blackbodyRadiance(uDiskTemperature) * pow(prof, 1.5) * pow(g, 3.0) * pl.b * uDiskGain * 0.6;
 
