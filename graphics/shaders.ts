@@ -36,6 +36,34 @@ export interface ShaderSource {
 /** Fixed attribute locations of the stars program (layout(location = N) in the shader). */
 export const ATTRIBUTES = { position: 0, luminosity: 1, temperature: 2, radius: 3 } as const;
 
+/**
+ * PLASMA CONTRACT (physics.ts -> blackhole shader). Optional: with uPlasmaMix = 0 the disk keeps its flat,
+ * realistic procedural look; physics.ts only ADDS realism on top.
+ * Texture: RGBA16F, LINEAR + mipmaps, wrap S = CLAMP, wrap T = REPEAT. Written in the disk's non-rotating frame
+ * (physics already advects it, so the shader does no animation of its own when plasma is present).
+ *   u = ln(r / rIn) / ln(rOut / rIn)      r in R_g, rIn = diskInnerRg > 0 ? diskInnerRg : iscoRadiusRg(spin)
+ *   v = azimuth / TAU + 0.5               azimuth = atan2(y, x) in the frame whose z axis is the spin axis
+ *   R = density / mean density (clumps, spiral arms, gaps; ~1 average)
+ *   G = temperature / Novikov-Thorne temperature (~1; MRI heating, shocks)
+ *   B = hot-spot / flare emissivity (>= 0; magnetic reconnection, orbiting blobs)
+ *   A = reserved (write 1)
+ * Uniforms: uPlasma (sampler), uPlasmaMix (0..1), uPlasmaSize (texture size in texels).
+ */
+export const PLASMA = {
+  format: 'RGBA16F',
+  channels: { r: 'density', g: 'temperature', b: 'hotspot', a: 'reserved' },
+  mapping: 'u = ln(r/rIn)/ln(rOut/rIn); v = azimuth/TAU + 0.5',
+  uniforms: ['uPlasma', 'uPlasmaMix', 'uPlasmaSize'],
+} as const;
+
+/** ISCO radius in R_g (identical to the shader's), so physics.ts maps the plasma texture the same way. */
+export function iscoRadiusRg(spin: number): number {
+  const a = Math.min(Math.max(spin, 0), 0.998);
+  const z1 = 1 + Math.cbrt(1 - a * a) * (Math.cbrt(1 + a) + Math.cbrt(1 - a));
+  const z2 = Math.sqrt(3 * a * a + z1 * z1);
+  return 3 + z2 - Math.sqrt((3 - z1) * (3 + z1 + 2 * z2));
+}
+
 const glsl = (...parts: readonly string[]): string => parts.join('\n');
 const VERT = '#version 300 es\nprecision highp float;\nprecision highp int;\n';
 const FRAG = '#version 300 es\nprecision highp float;\nprecision highp int;\nprecision highp sampler2D;\n';
@@ -331,7 +359,10 @@ void main() {
 //  - Mip/anisotropic-filtered lensing: uSceneColor MUST have mipmaps (LINEAR_MIPMAP_LINEAR, generateMipmap).
 //  - Supersampling (uSamples 1..8, jittered) + temporal smoothing (uHistory = previous output of this pass,
 //    rotation-reprojected, colour-clamped). Set uHistoryValid = 0 after a camera teleport / large move.
-// Uniforms: uCenter (m), uRg (GM/c^2, m), uSpinAxis, uSpin (0..0.998), uKerr, uBoundRg, uDiskInnerRg (<=0 -> ISCO),
+// Disk = thin opaque surface found at the equatorial-plane crossings (primary + lensed secondary images).
+// uDiskOpacity is optical depth per crossing / 20 (internally at least 3), uDiskHeight is unused.
+// PLASMA: optional uPlasma texture from physics.ts (see PLASMA contract at the top); uPlasmaMix = 0 -> flat procedural disk.
+// Uniforms: uCenter (m), uRg (GM/c^2, m), uSpinAxis, uSpin (0..0.998), uKerr, uBoundRg (auto-raised to enclose the disk), uDiskInnerRg (<=0 -> ISCO),
 // uDiskOuterRg, uDiskHeight (H/r), uDiskTemperature (peak K), uDiskOpacity, uDiskGain, uSurfaceRg,
 // uSurfaceTemperature, uMaxSteps (<=320), uFallback, uJetGain, uJetLengthRg, uJetWidth (Rg), uSamples, uJitter (px),
 // uMaxFootprint (px, ~16), uTemporalBlend (0..0.95), uHistoryValid, uPrevCamRight/Up/Forward, uPrevTanHalfFov.
@@ -367,6 +398,9 @@ uniform vec3 uPrevCamForward;
 uniform vec2 uPrevTanHalfFov;
 uniform sampler2D uSceneColor;
 uniform sampler2D uHistory;
+uniform sampler2D uPlasma;
+uniform float uPlasmaMix;
+uniform vec2 uPlasmaSize;
 out vec4 fragColor;
 
 float iscoRadius(float a) {
@@ -435,7 +469,9 @@ vec3 trace(vec2 fc) {
   vec3 m = ro + rd * tc;
   float b = safeLength(m);
   vec3 toC = b > 1e-4 ? -m / b : vec3(0.0);
-  float rb = max(uBoundRg, uJetGain > 0.0 ? uJetLengthRg * 1.05 : 0.0);
+  float rIn = uDiskInnerRg > 0.0 ? uDiskInnerRg : iscoRadius(clamp(uSpin, 0.0, 0.998));
+  float rOut = max(uDiskOuterRg, rIn * 1.5);
+  float rb = max(max(uBoundRg, rOut * 1.3), uJetGain > 0.0 ? uJetLengthRg * 1.05 : 0.0);
   bool inside = safeLength(ro) < rb;
   float h = b < rb ? sqrt(rb * rb - b * b) : 0.0;
   bool hits = b < 4.0e4 && (inside || (b < rb && tc - h > 0.0));
@@ -469,15 +505,14 @@ vec3 trace(vec2 fc) {
       float A = max(1.0 - f * c * c, 1e-3);
       pm = ((f * c + sqrt(f * f * c * c + A * (1.0 + f))) / A) * v;
     }
-    float rIn = uDiskInnerRg > 0.0 ? uDiskInnerRg : iscoRadius(a);
-    float rOut = max(uDiskOuterRg, rIn * 1.5);
     float tw = mod(uTime * C_LIGHT / uRg, 4000.0);
     float ph = fract(tw / 100.0);
     float pxAng = 2.0 * uTanHalfFov.y / uResolution.y;
     float jetLen = uJetLengthRg;
 
     for (int i = 0; i < 320; i++) {
-      if (i >= uMaxSteps) break;
+      if (i >= max(uMaxSteps, 240)) break;
+      vec3 pPrev = p;
       float r = length(p);
       float rk = kerr ? kerrR(p, a) : r;
       if (uSurfaceRg > 0.0 && r < uSurfaceRg) { fate = 2; break; }
@@ -488,8 +523,6 @@ vec3 trace(vec2 fc) {
       vec3 vn = normalize(v);
       float z = p.z;
       float rc = length(p.xy);
-      float hh = max(uDiskHeight, 0.03) * rc;
-      if (r < rOut * 1.1 && abs(z) < 4.0 * hh + 0.2) ell = min(ell, 0.3 * hh + 0.03);
 
       if (uJetGain > 0.0) {
         float az = abs(z);
@@ -502,38 +535,6 @@ vec3 trace(vec2 fc) {
           float gj = inversesqrt(1.0 - bj * bj);
           float dl = 1.0 / (gj * (1.0 + bj * sign(z) * vn.z));
           acc += trans * vec3(0.45, 0.65, 1.0) * uJetGain * dens * dl * dl * dl * ell;
-        }
-      }
-
-      if (rc > rIn && rc < rOut) {
-        float hz = max(uDiskHeight, 0.03) * rc;
-        float vert = exp(-0.5 * z * z / (hz * hz));
-        if (vert > 0.02) {
-          float x = rc / rIn;
-          float prof = 2.05 * pow(x, -0.75) * pow(max(1.0 - inversesqrt(x), 0.0), 0.25);
-          float Te = uDiskTemperature * prof;
-          vec3 phiDir = normalize(vec3(-p.y, p.x, 0.0));
-          float om = 1.0 / (pow(rc, 1.5) + a);
-          float beta = min(om * rc * inversesqrt(max(1.0 - 2.0 / rc, 0.05)), 0.92);
-          float gam = inversesqrt(1.0 - beta * beta);
-          float dopp = 1.0 / (gam * (1.0 + beta * dot(phiDir, vn)));
-          float g = dopp * sqrt(max(1.0 - 2.0 / r, 0.0));
-          float To = g * Te;
-          // shear-limited flow-map turbulence, faded when finer than a pixel
-          float wv = 0.03 * pow(rc / 10.0, -0.5);
-          float a0 = wv * 100.0 * ph;
-          float a1 = wv * 100.0 * (ph - 1.0);
-          float n0 = fbm(vec3(rot2(p.xy, a0) * 0.45, z * 0.8), 3);
-          float n1 = fbm(vec3(rot2(p.xy, a1) * 0.45, z * 0.8), 3);
-          float turb = 0.6 + 0.9 * mix(n0, n1, ph);
-          float pxSize = length(p - ro) * pxAng;
-          turb = mix(1.0, turb, 1.0 - smoothstep(0.3, 1.0, pxSize * 1.35));
-          float dtau = uDiskOpacity * vert * turb * sqrt(rIn / rc) * ell;
-          vec3 S = blackbodyColor(To) * blackbodyRadiance(To) * uDiskGain;
-          float al = 1.0 - exp(-dtau);
-          acc += trans * S * al;
-          trans *= 1.0 - al;
-          if (trans < 0.01) { fate = 4; break; }
         }
       }
 
@@ -552,8 +553,50 @@ vec3 trace(vec2 fc) {
         vec3 a1v = bhAccel(p, h2);
         v += 0.5 * (a0v + a1v) * dt;
       }
+      if ((pPrev.z > 0.0) != (p.z > 0.0)) {
+        float tt = pPrev.z / (pPrev.z - p.z);
+        vec3 hp = mix(pPrev, p, tt);
+        float rc2 = length(hp.xy);
+        if (rc2 > rIn && rc2 < rOut) {
+          vec3 vn2 = normalize(v);
+          float x = rc2 / rIn;
+          float pxSize = length(hp - ro) * pxAng;
+          vec4 pl = vec4(1.0, 1.0, 0.0, 1.0);
+          if (uPlasmaMix > 0.0) {
+            float lnR = log(rOut / rIn);
+            float dTexel = max(rc2 * lnR / uPlasmaSize.x, rc2 * TAU / uPlasmaSize.y);
+            float lod = log2(max(pxSize / dTexel, 1.0));
+            vec2 puv = vec2(clamp(log(x) / lnR, 0.0, 1.0), atan(hp.y, hp.x) / TAU + 0.5);
+            pl = mix(pl, textureLod(uPlasma, puv, lod), uPlasmaMix);
+          }
+          float prof = 2.05 * pow(x, -0.75) * pow(max(1.0 - inversesqrt(x), 0.0), 0.25);
+          float Te = uDiskTemperature * prof * pl.g;
+          vec3 phiDir = normalize(vec3(-hp.y, hp.x, 0.0));
+          float om = 1.0 / (pow(rc2, 1.5) + a);
+          float beta = min(om * rc2 * inversesqrt(max(1.0 - 2.0 / rc2, 0.05)), 0.92);
+          float gam = inversesqrt(1.0 - beta * beta);
+          float dopp = 1.0 / (gam * (1.0 + beta * dot(phiDir, vn2)));
+          float g = clamp(dopp * sqrt(max(1.0 - 2.0 / rc2, 0.0)), 0.35, 1.8);
+          float To = g * Te;
+          float wv = 0.03 * pow(rc2 / 10.0, -0.5);
+          float n0 = fbm(vec3(rot2(hp.xy, wv * 100.0 * ph) * 0.35, 0.0), 3);
+          float n1 = fbm(vec3(rot2(hp.xy, wv * 100.0 * (ph - 1.0)) * 0.35, 0.0), 3);
+          float bands = 0.75 + 0.5 * noise3(vec3(log(rc2) * 22.0, 3.7, 0.0));
+          float tex = bands * (0.65 + 0.7 * mix(n0, n1, ph));
+          tex = mix(1.0, tex, 1.0 - smoothstep(0.3, 1.0, pxSize / (0.05 * rc2)));
+          tex = mix(tex, pl.r, uPlasmaMix);
+          float edge = (1.0 - smoothstep(0.78 * rOut, rOut, rc2)) * smoothstep(rIn, rIn * 1.04, rc2);
+          vec3 S = blackbodyColor(To) * blackbodyRadiance(To) * uDiskGain * tex;
+          S += blackbodyColor(To * 1.25) * blackbodyRadiance(To) * uDiskGain * pl.b;
+          float al = edge * (1.0 - exp(-max(uDiskOpacity * 20.0, 3.0))) * clamp(0.45 + 0.55 * pl.r, 0.0, 1.0);
+          acc += trans * S * al;
+          trans *= 1.0 - al;
+          if (trans < 0.01) { fate = 4; break; }
+        }
+      }
     }
 
+    if (fate == 0 && length(p) < rb * 0.5) fate = 1;
     vec3 vn = normalize(v);
     if (fate == 2) {
       float To = uSurfaceTemperature * sqrt(max(1.0 - 2.0 / uSurfaceRg, 0.0));
@@ -750,7 +793,8 @@ void main() {
 // ---------------------------------------------------------------------------------------------
 // cosmicWeb: periodic Voronoi filaments/sheets/nodes, log-spaced steps through voids. Blend: add.
 // Uniforms: uCamCell (camera position in cell units, reduced modulo ~1024 on the CPU), uCellSize (m),
-// uMinDist, uMaxDist (m), uFilament (~0.12), uGain, uSteps (<=64).
+// uMinDist, uMaxDist (m, set >= 40 cells), uFilament (~0.12), uGain, uSteps (<=96),
+// uVisibility (0..1): 0 inside a galaxy, ramp to 1 as the camera reaches the cluster/supercluster tiers.
 // ---------------------------------------------------------------------------------------------
 const COSMICWEB_FS = glsl(FRAG, MATH, NOISE, CAMERA, `
 uniform vec3 uCamCell;
@@ -759,16 +803,20 @@ uniform float uMinDist;
 uniform float uMaxDist;
 uniform float uFilament;
 uniform float uGain;
+uniform float uVisibility;
 uniform int uSteps;
 out vec4 fragColor;
 void main() {
+  if (uVisibility <= 0.001) { fragColor = vec4(0.0); return; }
   vec3 rd = viewRay(gl_FragCoord.xy);
-  int n = clamp(uSteps, 8, 64);
-  float ratio = pow(uMaxDist / uMinDist, 1.0 / float(n));
-  float t = uMinDist * pow(ratio, ign(gl_FragCoord.xy));
+  int n = clamp(uSteps, 16, 96);
+  float t0 = max(min(uMinDist, 0.05 * uCellSize), 1.0);
+  float ratio = pow(uMaxDist / t0, 1.0 / float(n));
+  float t = t0 * pow(ratio, ign(gl_FragCoord.xy));
   vec3 acc = vec3(0.0);
-  for (int i = 0; i < 64; i++) {
+  for (int i = 0; i < 96; i++) {
     if (i >= n) break;
+    float u = float(i) / float(n);
     float dt = t * (ratio - 1.0);
     vec3 p = uCamCell + rd * (t / uCellSize);
     vec3 v = voronoi3(p);
@@ -776,12 +824,12 @@ void main() {
     float fil = exp(-(v.z - v.x) / uFilament);
     float clump = noise3(p * 5.0);
     float node = fil * smoothstep(0.65, 1.0, clump);
-    float fade = 1.0 - smoothstep(0.6, 1.0, float(i) / float(n));
+    float fade = exp(-2.5 * u) * smoothstep(0.0, 0.06, u + 0.02) * (1.0 - smoothstep(0.8, 1.0, u));
     vec3 col = mix(vec3(0.45, 0.58, 1.0), vec3(1.0, 0.78, 0.5), node);
     acc += col * (0.15 * sheet + fil * fil + 2.5 * node) * (0.6 + 0.8 * clump) * fade * (dt / uCellSize) * uGain;
     t *= ratio;
   }
-  fragColor = hdrOut(acc, 0.0);
+  fragColor = hdrOut(acc * uVisibility, 0.0);
 }`);
 
 // ---------------------------------------------------------------------------------------------
