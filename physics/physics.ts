@@ -296,10 +296,15 @@ const MIN_REBUILD_MS = 400;
 const ARMS = 2;
 /** The shader orbits the texture between builds, so a new build is only needed for the slow evolution: every this many R_g / c. */
 const REBUILD_STEP_RG = 3;
-/** Turbulence: feature size in azimuth (cycles per radian-ish, larger = finer), in ln(r), and the density contrast. */
+/**
+ * Turbulence: feature size in azimuth (cycles per radian-ish, larger = finer), in ln(r), and the density contrast.
+ * Thin in ln(r) and long in azimuth: each feature is a separate glowing strand with dark gaps on both sides, which the
+ * shear winds into spirals and the lensing in the blackhole shader bends over and under the shadow as distinct rays.
+ * 28 per unit ln(r) is about 18 texels per strand at the default 256 texels, so the strands stay resolved.
+ */
 const STREAK_PHI = 2.5;
-const STREAK_R = 7;
-const DENSITY_CONTRAST = 0.9;
+const STREAK_R = 28;
+const DENSITY_CONTRAST = 2.2;
 /** Temperature fluctuation amplitude (fraction of the local temperature). Brightness goes as T^4, so this must stay small. */
 const TEMPERATURE_NOISE = 0.08;
 
