@@ -415,13 +415,13 @@ const float B_CRIT = 5.196152;
 const float HALF_PI = 1.5707963;
 // Strength of the fine turbulence filaments in the disk (exponent on the zero-mean noise). Real disk turbulence is a
 // subtle modulation of the emission; strong values read as concentric record-groove rings.
-const float RING_CONTRAST = 0.8;
+const float RING_CONTRAST = 1.1;
 // Exponent on the local disk temperature in the emitted intensity. The physical value is 4, which dims the outer disk
 // to almost nothing; a lower value keeps a long, bright, gold band across the frame (the reference look) while the
 // inner edge and the lensed arcs stay as bright (renderer.ts lowers peakLevel to match).
 const float DISK_TEMP_POWER = 2.0;
 // The disk's outer edge fades over this last fraction of its radius, so the rim stays crisp instead of hazy.
-const float DISK_EDGE_START = 0.85;
+const float DISK_EDGE_START = 0.93;
 // Coolest colour temperature (K) the disk shows. The colour runs from here (outer disk, receding side) up to the hottest
 // displayed colour (inner edge, approaching side): a high floor keeps the whole disk gold and blends it smoothly, a low
 // one (about 1700) turns the outer disk orange and brown.
@@ -511,7 +511,7 @@ vec4 shadeDisk(vec2 hp, vec3 vd, vec2 dx, vec2 dy, float rIn, float rOut) {
     vec4 avgP = textureLod(uPlasma, vec2(pu, 0.5), 8.0);
     pl = mix(vec4(1.0, 1.0, 0.0, 1.0), mix(avgP, sharpP, wAz), uPlasmaMix);
   }
-  tex *= pow(max(pl.r, 0.05), 0.7);
+  tex *= pow(max(pl.r, 0.05), 1.0);
 
   float tp = prof * pl.g;
   // The observed intensity scales with g^4 (Liouville), so the side moving towards us is much brighter than the
@@ -526,8 +526,10 @@ vec4 shadeDisk(vec2 hp, vec3 vd, vec2 dx, vec2 dy, float rIn, float rOut) {
 
   float aIn = smoothstep(rIn - 0.5 * fr - 0.03, rIn + 0.5 * fr + 0.03, rc);
   float aOut = 1.0 - smoothstep(DISK_EDGE_START * rOut, rOut, rc);
+  // The disk is optically thick: an opaque sheet of plasma. Density only brightens or darkens it and never makes it
+  // see-through (before, low-density patches let the lensed images behind it show through, which read as translucent).
   float base = 1.0 - exp(-max(uDiskOpacity * 20.0, 3.0));
-  return vec4(S, base * aIn * aOut * mix(1.0, clamp(0.7 + 0.3 * pl.r, 0.0, 1.0), uPlasmaMix));
+  return vec4(S, base * aIn * aOut);
 }
 
 vec3 trace(vec2 fc) {
