@@ -47,7 +47,7 @@
  *   are expressed display-referred (settings.cmb.level, settings.cosmicWeb.level,
  *   settings.blackHole.peakLevel): the renderer divides by exposure so they look the same at
  *   any exposure. Physical inputs (star luminosity, illuminants, planet palettes) are passed
- *   through unchanged. Tonemap applies postExposure, bloom, vignette, ACES, sRGB and dither
+ *   through unchanged. Tonemap applies postExposure, bloom, vignette, a hue-preserving ACES (settings.tonemap), sRGB and dither
  *   itself, so the canvas receives display-ready values.
  *
  * Mutating a scene: pass a new object, or bump scene.revision (idle frames are reused while
@@ -90,6 +90,11 @@ export interface RendererSettings {
   postExposure: number;
   /** uVignette of the tonemap pass (0 = off). */
   vignette: number;
+  /**
+   * Colour handling of the tonemap pass. hueKeep: 0 = classic per-channel ACES, 1 = hue-preserving (hot orange stays
+   * orange). Highlights bleach to white between bleachStart and bleachEnd (display-referred, before the curve).
+   */
+  tonemap: { hueKeep: number; bleachStart: number; bleachEnd: number };
   /** uDepthRange: near and far in metres for the reversed logarithmic depth. */
   depthRange: readonly [number, number];
   /** Shed raymarch steps when the GPU is the bottleneck at minimum resolution. */
@@ -495,6 +500,7 @@ export const DEFAULT_RENDERER_SETTINGS: Readonly<RendererSettings> = {
   exposure: 1,
   postExposure: 1,
   vignette: 0.35,
+  tonemap: { hueKeep: 1, bleachStart: 2, bleachEnd: 10 },
   depthRange: [0.1, 1e27],
   adaptiveWork: true,
   maxFlashHz: 3,
@@ -525,7 +531,7 @@ export const DEFAULT_RENDERER_SETTINGS: Readonly<RendererSettings> = {
   },
   stars: { psfSigmaPx: 0.9, pointSizeMax: 64, spikeStrength: 1, maxPerField: 1 << 20 },
   blackHole: {
-    peakLevel: 4.5,
+    peakLevel: 16,
     samples: 1,
     maxFootprintPx: 16,
     temporalBlend: 0.6,
@@ -533,7 +539,7 @@ export const DEFAULT_RENDERER_SETTINGS: Readonly<RendererSettings> = {
     plasmaSize: 256,
     plasmaBudgetMs: 3,
   },
-  bloom: { strength: 0.04, radius: 1, weight: 0.65, levels: 6 },
+  bloom: { strength: 0.07, radius: 1, weight: 0.65, levels: 6 },
   steps: { galaxy: 48, nebula: 64, clouds: 48, pulsar: 48, cosmicWeb: 32, blackHole: 256 },
 };
 
@@ -565,6 +571,10 @@ function validateSettings(s: RendererSettings): void {
   if (!(s.exposure > 0 && Number.isFinite(s.exposure))) bad('exposure must be a positive number');
   if (!(s.postExposure > 0 && Number.isFinite(s.postExposure))) bad('postExposure must be a positive number');
   if (!(s.vignette >= 0)) bad('vignette must be >= 0');
+  if (!(s.tonemap.hueKeep >= 0 && s.tonemap.hueKeep <= 1)) bad('tonemap.hueKeep must be between 0 and 1');
+  if (!(s.tonemap.bleachStart >= 0 && s.tonemap.bleachEnd > s.tonemap.bleachStart)) {
+    bad('tonemap must satisfy 0 <= bleachStart < bleachEnd');
+  }
   if (!(s.depthRange[0] > 0 && s.depthRange[1] > s.depthRange[0])) bad('depthRange must satisfy 0 < near < far');
   if (!(s.cmb.temperatureK > 0)) bad('cmb.temperatureK must be positive');
   if (!(s.cmb.level >= 0)) bad('cmb.level must be >= 0');
@@ -2366,6 +2376,9 @@ export function createRenderer(options: RendererOptions = {}): Renderer {
     f1(p, 'uPostExposure', settings.postExposure);
     f1(p, 'uBloomStrength', bloom === null ? 0 : settings.bloom.strength);
     f1(p, 'uVignette', settings.vignette);
+    f1(p, 'uHueKeep', settings.tonemap.hueKeep);
+    f1(p, 'uBleachStart', settings.tonemap.bleachStart);
+    f1(p, 'uBleachEnd', settings.tonemap.bleachEnd);
     drawFullscreen();
     bindTex(0, null);
     bindTex(1, null);
