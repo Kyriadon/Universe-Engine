@@ -427,16 +427,21 @@ const float DISK_EDGE_START = 0.93;
 // turns tan or beige. DISK_COLOR_WASH mixes a little neutral light into the blackbody tint (scattered light, lens haze),
 // which keeps the red-orange from clipping into a flat, pure primary. It is small so the colours stay vivid and glowing.
 const float DISK_COLOR_MIN_K = 1667.0;
-const float DISK_COLOR_MAX_K = 2400.0;
+const float DISK_COLOR_MAX_K = 2200.0;
 const float DISK_COLOR_CURVE = 2.0;
 const float DISK_COLOR_WASH = 0.02;
+// Green gain of the disk tint. The reddest blackbody the colour fit can express is about 1667 K, which is still a plain
+// orange (green about 0.18 of red); scaling the green channel pushes the whole disk towards a deep, glowing red.
+const float DISK_COLOR_GREEN_GAIN = 0.65;
 // Crossings of the disk plane are recorded from this far inside the inner edge (R_g), enough for the soft anti-aliased
 // edge. Crossings deeper inside are empty space: recording them burned the four crossing slots of the rays that wind
 // around the photon sphere, so the thin photon ring ended abruptly (fate 4) before its higher-order images.
 const float RIN_SOFT = 0.25;
 
 vec3 diskTint(float T) {
-  return mix(blackbodyColor(T), vec3(1.0), DISK_COLOR_WASH);
+  vec3 c = mix(blackbodyColor(T), vec3(1.0), DISK_COLOR_WASH);
+  c.g *= DISK_COLOR_GREEN_GAIN;
+  return c;
 }
 float iscoRadius(float a) {
   a = clamp(a, 0.0, 0.998);
