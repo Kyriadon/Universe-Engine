@@ -1,7 +1,8 @@
 import { translate, type Vec3 } from './coords';
 import { createGL } from '../../../graphics/gl';
-import { Gravity, blackHoleSource } from '../../../physics/physics';
+import { Gravity, blackHoleSource, distanceForShadowFillRg } from '../../../physics/physics';
 import {
+  DEFAULT_RENDERER_SETTINGS,
   createRenderer,
   type BlackHoleBody,
   type RenderScene,
@@ -36,8 +37,9 @@ function isBlackHole(member: MilkyWayMember): member is BlackHole {
 const VIEW_ANGLE_FROM_POLE_RAD = (84 * Math.PI) / 180;
 const SPIN_AXIS: Vec3 = [0, Math.sin(VIEW_ANGLE_FROM_POLE_RAD), Math.cos(VIEW_ANGLE_FROM_POLE_RAD)];
 
-// The disk is cut at this radius (R_g) so it stays thin and sharp at the spawn distance.
-const DISK_OUTER_RG = 20;
+// The disk is cut at this radius (R_g): beyond it the emission is already a faint red, and the cut keeps the shadow the
+// dominant shape at the spawn distance.
+const DISK_OUTER_RG = 16;
 
 /** Convert black-hole information into renderer input. */
 function toBlackHoleBody(bh: BlackHole): BlackHoleBody {
@@ -82,9 +84,12 @@ if (!centralBlackHole) {
   );
 }
 
-// Spawn 30 gravitational radii away from the centre of Sagittarius A*, so the shadow fills about a third of the
-// screen. Approximately 190 million kilometres with the current Sgr A* data.
-const CAMERA_DISTANCE_M = centralBlackHole.rgM * 30;
+// Spawn where the shadow fills this fraction of the view height: a large, truly black shadow with the disk lensed tight
+// around it. The distance follows from the lensing law (physics.ts) and the renderer's field of view, so it stays right
+// if either changes; about 120 million kilometres with the current Sgr A* data.
+const SHADOW_FILL_OF_VIEW = 0.45;
+const CAMERA_DISTANCE_M =
+  centralBlackHole.rgM * distanceForShadowFillRg(SHADOW_FILL_OF_VIEW, DEFAULT_RENDERER_SETTINGS.verticalFovDeg);
 
 // Position the camera directly along +Z.
 const cameraStart = translate(
