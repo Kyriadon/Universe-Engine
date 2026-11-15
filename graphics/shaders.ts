@@ -415,7 +415,7 @@ const float B_CRIT = 5.196152;
 const float HALF_PI = 1.5707963;
 // Strength of the fine turbulence filaments in the disk (exponent on the zero-mean noise). Real disk turbulence is a
 // subtle modulation of the emission; strong values read as concentric record-groove rings.
-const float RING_CONTRAST = 1.1;
+const float RING_CONTRAST = 1.4;
 // Exponent on the local disk temperature in the emitted intensity. 4 is the physical value (I ~ T^4): the disk is
 // blindingly bright at the inner edge and falls off steeply, so the far disk shows only as dim red streaks.
 const float DISK_TEMP_POWER = 4.0;
@@ -425,11 +425,11 @@ const float DISK_EDGE_START = 0.93;
 // (inner edge, approaching side). The range is narrow on purpose: the whole disk stays a deep red-orange and only the
 // tonemapper bleaches whatever is brighter than the display can show, so the hot core goes white while the rest never
 // turns tan or beige. DISK_COLOR_WASH mixes a little neutral light into the blackbody tint (scattered light, lens haze),
-// which lifts the blue channel so the red-orange reads as copper and coral instead of a pure saturated orange.
-const float DISK_COLOR_MIN_K = 1700.0;
-const float DISK_COLOR_MAX_K = 2100.0;
+// which keeps the red-orange from clipping into a flat, pure primary. It is small so the colours stay vivid and glowing.
+const float DISK_COLOR_MIN_K = 1667.0;
+const float DISK_COLOR_MAX_K = 2400.0;
 const float DISK_COLOR_CURVE = 2.0;
-const float DISK_COLOR_WASH = 0.09;
+const float DISK_COLOR_WASH = 0.02;
 // Crossings of the disk plane are recorded from this far inside the inner edge (R_g), enough for the soft anti-aliased
 // edge. Crossings deeper inside are empty space: recording them burned the four crossing slots of the rays that wind
 // around the photon sphere, so the thin photon ring ended abruptly (fate 4) before its higher-order images.
