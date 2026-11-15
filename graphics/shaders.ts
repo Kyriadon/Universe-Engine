@@ -416,16 +416,17 @@ const float HALF_PI = 1.5707963;
 // Strength of the fine turbulence filaments in the disk (exponent on the zero-mean noise). Real disk turbulence is a
 // subtle modulation of the emission; strong values read as concentric record-groove rings.
 const float RING_CONTRAST = 1.1;
-// Exponent on the local disk temperature in the emitted intensity. The physical value is 4, which dims the outer disk
-// to almost nothing; a lower value keeps a long, bright, gold band across the frame (the reference look) while the
-// inner edge and the lensed arcs stay as bright (renderer.ts lowers peakLevel to match).
-const float DISK_TEMP_POWER = 2.0;
+// Exponent on the local disk temperature in the emitted intensity. 4 is the physical value (I ~ T^4): the disk is
+// blindingly bright at the inner edge and falls off steeply, so the far disk shows only as dim red streaks.
+const float DISK_TEMP_POWER = 4.0;
 // The disk's outer edge fades over this last fraction of its radius, so the rim stays crisp instead of hazy.
 const float DISK_EDGE_START = 0.93;
-// Coolest colour temperature (K) the disk shows. The colour runs from here (outer disk, receding side) up to the hottest
-// displayed colour (inner edge, approaching side): a high floor keeps the whole disk gold and blends it smoothly, a low
-// one (about 1700) turns the outer disk orange and brown.
-const float DISK_COLOR_MIN_K = 3600.0;
+// The disk's colour runs from the coolest displayed temperature (outer disk, receding side: deep red) up to the hottest
+// (inner edge, approaching side: white). The curve exponent keeps most of the disk a saturated orange; only the hottest
+// plasma climbs to yellow and white, and the tonemapper bleaches whatever is brighter than the display can show.
+const float DISK_COLOR_MIN_K = 1800.0;
+const float DISK_COLOR_MAX_K = 6500.0;
+const float DISK_COLOR_CURVE = 2.0;
 
 float iscoRadius(float a) {
   a = clamp(a, 0.0, 0.998);
@@ -518,9 +519,9 @@ vec4 shadeDisk(vec2 hp, vec3 vd, vec2 dx, vec2 dy, float rIn, float rOut) {
   // receding side. The radial falloff follows DISK_TEMP_POWER. The observed colour temperature is the emitted one
   // times g, so the bright side is also the whiter side.
   float I = pow(tp, DISK_TEMP_POWER) * pow(g, 4.0);
-  float tmax = min(uDiskVisTemp > 0.0 ? uDiskVisTemp : 5600.0, 5600.0);
+  float tmax = min(uDiskVisTemp > 0.0 ? uDiskVisTemp : DISK_COLOR_MAX_K, DISK_COLOR_MAX_K);
   float tmin = min(DISK_COLOR_MIN_K, tmax);
-  float Tcol = tmin + (tmax - tmin) * pow(clamp(tp * g / 1.15, 0.0, 1.0), 1.2);
+  float Tcol = tmin + (tmax - tmin) * pow(clamp(tp * g / 1.15, 0.0, 1.0), DISK_COLOR_CURVE);
   vec3 S = blackbodyColor(Tcol) * blackbodyRadiance(uDiskTemperature) * I * tex * uDiskGain * 0.6;
   S += blackbodyColor(min(Tcol * 1.3, 9000.0)) * blackbodyRadiance(uDiskTemperature) * pow(prof, 1.5) * pow(g, 3.0) * pl.b * uDiskGain * 0.6;
 
@@ -1345,7 +1346,7 @@ void main() {
 // ---------------------------------------------------------------------------------------------
 // post-processing. bloomDown: uSource, uTexel (1/source size), uInvOutSize, uFirstPass (1 on the first
 // level: Karis average). bloomUp: uSource (lower mip), uPrev (this level's down result), uTexel, uInvOutSize,
-// uRadius, uWeight. tonemap: uScene, uBloom, uPostExposure, uBloomStrength, uVignette. copy: uSource.
+// uRadius, uWeight. tonemap: uScene, uBloom, uPostExposure, uBloomStrength, uVignette, uHueKeep, uBleachStart, uBleachEnd. copy: uSource.
 // ---------------------------------------------------------------------------------------------
 const BLOOM_DOWN_FS = glsl(FRAG, MATH, `
 uniform sampler2D uSource;
@@ -1398,9 +1399,21 @@ uniform sampler2D uBloom;
 uniform float uPostExposure;
 uniform float uBloomStrength;
 uniform float uVignette;
+uniform float uHueKeep;
+uniform float uBleachStart;
+uniform float uBleachEnd;
 out vec4 fragColor;
 vec3 acesFilm(vec3 x) {
   return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+}
+// Hue-preserving ACES: the curve is applied to the brightest channel and the colour is scaled with it, so hot orange
+// plasma stays orange instead of turning pale yellow. Only highlights brighter than uBleachStart bleach towards white
+// (fully white at uBleachEnd), like a sensor that saturates.
+vec3 acesHue(vec3 c) {
+  float m = max(max(c.r, c.g), max(c.b, 1e-6));
+  float t = acesFilm(vec3(m)).x;
+  float w = smoothstep(uBleachStart, uBleachEnd, m);
+  return mix(c * (t / m), vec3(t), w);
 }
 void main() {
   vec2 size = vec2(textureSize(uScene, 0));
@@ -1410,7 +1423,7 @@ void main() {
   col *= uPostExposure;
   vec2 q = uv * 2.0 - 1.0;
   col *= 1.0 - uVignette * dot(q, q) * 0.25;
-  col = srgbEncode(acesFilm(col));
+  col = srgbEncode(mix(acesFilm(col), acesHue(col), uHueKeep));
   col += (ign(gl_FragCoord.xy) - 0.5) / 255.0;
   fragColor = vec4(col, 1.0);
 }`);
