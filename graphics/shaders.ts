@@ -422,12 +422,22 @@ const float DISK_TEMP_POWER = 4.0;
 // The disk's outer edge fades over this last fraction of its radius, so the rim stays crisp instead of hazy.
 const float DISK_EDGE_START = 0.93;
 // The disk's colour runs from the coolest displayed temperature (outer disk, receding side: deep red) up to the hottest
-// (inner edge, approaching side: white). The curve exponent keeps most of the disk a saturated orange; only the hottest
-// plasma climbs to yellow and white, and the tonemapper bleaches whatever is brighter than the display can show.
-const float DISK_COLOR_MIN_K = 1800.0;
-const float DISK_COLOR_MAX_K = 6500.0;
+// (inner edge, approaching side). The range is narrow on purpose: the whole disk stays a deep red-orange and only the
+// tonemapper bleaches whatever is brighter than the display can show, so the hot core goes white while the rest never
+// turns tan or beige. DISK_COLOR_WASH mixes a little neutral light into the blackbody tint (scattered light, lens haze),
+// which lifts the blue channel so the red-orange reads as copper and coral instead of a pure saturated orange.
+const float DISK_COLOR_MIN_K = 1700.0;
+const float DISK_COLOR_MAX_K = 2100.0;
 const float DISK_COLOR_CURVE = 2.0;
+const float DISK_COLOR_WASH = 0.09;
+// Crossings of the disk plane are recorded from this far inside the inner edge (R_g), enough for the soft anti-aliased
+// edge. Crossings deeper inside are empty space: recording them burned the four crossing slots of the rays that wind
+// around the photon sphere, so the thin photon ring ended abruptly (fate 4) before its higher-order images.
+const float RIN_SOFT = 0.25;
 
+vec3 diskTint(float T) {
+  return mix(blackbodyColor(T), vec3(1.0), DISK_COLOR_WASH);
+}
 float iscoRadius(float a) {
   a = clamp(a, 0.0, 0.998);
   float z1 = 1.0 + pow(1.0 - a * a, 1.0 / 3.0) * (pow(1.0 + a, 1.0 / 3.0) + pow(1.0 - a, 1.0 / 3.0));
@@ -522,8 +532,8 @@ vec4 shadeDisk(vec2 hp, vec3 vd, vec2 dx, vec2 dy, float rIn, float rOut) {
   float tmax = min(uDiskVisTemp > 0.0 ? uDiskVisTemp : DISK_COLOR_MAX_K, DISK_COLOR_MAX_K);
   float tmin = min(DISK_COLOR_MIN_K, tmax);
   float Tcol = tmin + (tmax - tmin) * pow(clamp(tp * g / 1.15, 0.0, 1.0), DISK_COLOR_CURVE);
-  vec3 S = blackbodyColor(Tcol) * blackbodyRadiance(uDiskTemperature) * I * tex * uDiskGain * 0.6;
-  S += blackbodyColor(min(Tcol * 1.3, 9000.0)) * blackbodyRadiance(uDiskTemperature) * pow(prof, 1.5) * pow(g, 3.0) * pl.b * uDiskGain * 0.6;
+  vec3 S = diskTint(Tcol) * blackbodyRadiance(uDiskTemperature) * I * tex * uDiskGain * 0.6;
+  S += diskTint(min(Tcol * 1.3, 9000.0)) * blackbodyRadiance(uDiskTemperature) * pow(prof, 1.5) * pow(g, 3.0) * pl.b * uDiskGain * 0.6;
 
   float aIn = smoothstep(rIn - 0.5 * fr - 0.03, rIn + 0.5 * fr + 0.03, rc);
   float aOut = 1.0 - smoothstep(DISK_EDGE_START * rOut, rOut, rc);
@@ -545,7 +555,7 @@ vec3 trace(vec2 fc) {
   if (r0 < 2.0) return vec3(0.0);
   float rIn = uDiskInnerRg > 0.0 ? uDiskInnerRg : iscoRadius(clamp(uSpin, 0.0, 0.998));
   float rOut = max(uDiskOuterRg, rIn * 1.5);
-  float rLow = max(rIn * 0.8, 2.02);
+  float rLow = max(rIn - RIN_SOFT, 2.02);
   bool hasDisk = uDiskTemperature > 0.0;
 
   // Orbit plane basis: a = towards the camera, c = the direction the ray turns into. P(phi) = r (cos(phi) a + sin(phi) c).
@@ -581,7 +591,7 @@ vec3 trace(vec2 fc) {
   vec3 v4 = vec3(0.0, 0.0, 1.0);
   int fate = 0;
   float phiE = 0.0;
-  int nIter = clamp(uMaxSteps / 2, 64, 256);
+  int nIter = clamp(uMaxSteps, 64, 256);
 
   for (int i = 0; i < 256; i++) {
     if (i >= nIter) break;
@@ -609,7 +619,7 @@ vec3 trace(vec2 fc) {
         if (nC == 0) { h1 = rX * er.xy; v1 = vd; }
         else if (nC == 1) { h2 = rX * er.xy; v2 = vd; }
         else if (nC == 2) { h3 = rX * er.xy; v3 = vd; }
-        else { h4 = rX * er.xy; v4 = vd; }
+        else if (nC == 3) { h4 = rX * er.xy; v4 = vd; }
         nC += 1;
       }
       nextX += PI;
