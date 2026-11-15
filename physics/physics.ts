@@ -263,6 +263,25 @@ export function wienPeakWavelengthM(temperatureK: number): number {
   return WIEN_DISPLACEMENT_M_K / temperatureK;
 }
 
+/**
+ * Distance in R_g at which a static observer sees the black hole's shadow fill `fill` (0..1) of the view height through
+ * a rectilinear camera with vertical field of view verticalFovDeg. The shadow's angular radius alpha obeys
+ * sin(alpha) = (b_c / d) sqrt(1 - 2 / d), with b_c the critical impact parameter; solved by fixed-point iteration.
+ */
+export function distanceForShadowFillRg(fill: number, verticalFovDeg: number): number {
+  if (!(fill > 0 && fill < 1)) throw new RangeError('distanceForShadowFillRg: fill must be between 0 and 1');
+  if (!(verticalFovDeg > 0 && verticalFovDeg < 180)) {
+    throw new RangeError('distanceForShadowFillRg: verticalFovDeg must be between 0 and 180');
+  }
+  const tanHalfFov = Math.tan((verticalFovDeg * Math.PI) / 360);
+  const sinAlpha = Math.sin(Math.atan(fill * tanHalfFov));
+  let d = CRITICAL_IMPACT_PARAMETER_RG / sinAlpha;
+  for (let i = 0; i < 32; i++) {
+    d = (CRITICAL_IMPACT_PARAMETER_RG * Math.sqrt(1 - 2 / Math.max(d, 2.0001))) / sinAlpha;
+  }
+  return d;
+}
+
 // ---------------------------------------------------------------------------------------------
 // PLASMA
 // ---------------------------------------------------------------------------------------------
