@@ -1,6 +1,7 @@
 import { translate, type Vec3 } from './coords';
 import { createGL } from '../../../graphics/gl';
 import { Gravity, blackHoleSource, distanceForShadowFillRg } from '../../../physics/physics';
+import { iscoRadiusRg } from '../../../graphics/shaders';
 import {
   DEFAULT_RENDERER_SETTINGS,
   createRenderer,
@@ -35,11 +36,31 @@ function isBlackHole(member: MilkyWayMember): member is BlackHole {
 // The data has no spin axis yet, so the axis is derived from the angle the spawn view makes with the pole: 84 degrees is
 // almost edge-on, a little above the disk plane, which gives the classic photon-ring look (camera on +Z, axis tilted in Y-Z).
 const VIEW_ANGLE_FROM_POLE_RAD = (84 * Math.PI) / 180;
-const SPIN_AXIS: Vec3 = [0, Math.sin(VIEW_ANGLE_FROM_POLE_RAD), Math.cos(VIEW_ANGLE_FROM_POLE_RAD)];
+
+// Sense of rotation about that axis: +1 turns the near side of the disk to the right of the screen (the receding limb on
+// the right), -1 the opposite. -1 puts the approaching, Doppler-beamed limb on the right of the shadow. The disk plane
+// is the same for both signs, so only the beaming side changes.
+const SPIN_SENSE: 1 | -1 = -1;
+const SPIN_AXIS: Vec3 = [
+  0,
+  SPIN_SENSE * Math.sin(VIEW_ANGLE_FROM_POLE_RAD),
+  SPIN_SENSE * Math.cos(VIEW_ANGLE_FROM_POLE_RAD),
+];
+
+// The blackhole shader traces Schwarzschild geodesics (shadow b = 3 sqrt(3) R_g, photon sphere at 3 R_g), so the inner
+// edge of the disk is the Schwarzschild ISCO. The Kerr ISCO of the data's spin (about 2.3 R_g at a = 0.9) lies inside
+// the photon sphere of that metric: the disk images then swallow the shadow edge and smear into one blob with no thin
+// lensed ribbons. The spin value itself still drives the Keplerian rate of the disk.
+const DISK_INNER_RG = iscoRadiusRg(0);
 
 // The disk is cut at this radius (R_g): beyond it the emission is already a faint red, and the cut keeps the shadow the
-// dominant shape at the spawn distance.
+// dominant shape at the spawn distance. It must stay below the camera's spawn distance (CAMERA_DISTANCE_M below),
+// otherwise the camera starts inside the disk.
 const DISK_OUTER_RG = 16;
+
+// Display-referred brightness of the hottest disk pixel (settings.blackHole.peakLevel). Lower than the renderer's
+// default so the inner edge stays far brighter than the outer disk, which falls away into dim red streaks.
+const DISK_PEAK_LEVEL = 6;
 
 /** Convert black-hole information into renderer input. */
 function toBlackHoleBody(bh: BlackHole): BlackHoleBody {
@@ -58,6 +79,7 @@ function toBlackHoleBody(bh: BlackHole): BlackHoleBody {
         ...oriented,
         disk: {
           peakTemperatureK: flow.temperatureK.inner,
+          innerRg: DISK_INNER_RG,
           outerRg: DISK_OUTER_RG,
         },
       }
@@ -111,7 +133,11 @@ const gravity = new Gravity(
 // RENDERER
 // ---------------------------------------------------------------------------
 
-const renderer = createRenderer();
+const renderer = createRenderer({
+  settings: {
+    blackHole: { peakLevel: DISK_PEAK_LEVEL },
+  },
+});
 
 const handle = createGL(
   (frame) => renderer.render(frame, scene),
