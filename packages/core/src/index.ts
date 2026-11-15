@@ -35,7 +35,7 @@ function isBlackHole(member: MilkyWayMember): member is BlackHole {
 
 // The data has no spin axis yet, so the axis is derived from the angle the spawn view makes with the pole: 84 degrees is
 // almost edge-on, a little above the disk plane, which gives the classic photon-ring look (camera on +Z, axis tilted in Y-Z).
-const VIEW_ANGLE_FROM_POLE_RAD = (84 * Math.PI) / 180;
+const VIEW_ANGLE_FROM_POLE_RAD = (88 * Math.PI) / 180;
 
 // Sense of rotation about that axis: +1 turns the near side of the disk to the right of the screen (the receding limb on
 // the right), -1 the opposite. -1 puts the approaching, Doppler-beamed limb on the right of the shadow. The disk plane
@@ -53,14 +53,18 @@ const SPIN_AXIS: Vec3 = [
 // lensed ribbons. The spin value itself still drives the Keplerian rate of the disk.
 const DISK_INNER_RG = iscoRadiusRg(0);
 
-// The disk is cut at this radius (R_g): beyond it the emission is already a faint red, and the cut keeps the shadow the
-// dominant shape at the spawn distance. It must stay below the camera's spawn distance (CAMERA_DISTANCE_M below),
-// otherwise the camera starts inside the disk.
-const DISK_OUTER_RG = 16;
+// The disk is a compact, thin ring: it is cut at this multiple of its inner radius, so the shadow stays the dominant
+// shape and the bright ribbons hug it. The radius must stay below the camera's spawn distance (CAMERA_DISTANCE_M
+// below), otherwise the camera starts inside the disk.
+const DISK_OUTER_OVER_INNER = 1.75;
+const DISK_OUTER_RG = DISK_INNER_RG * DISK_OUTER_OVER_INNER;
 
-// Display-referred brightness of the hottest disk pixel (settings.blackHole.peakLevel). Lower than the renderer's
-// default so the inner edge stays far brighter than the outer disk, which falls away into dim red streaks.
-const DISK_PEAK_LEVEL = 6;
+// Display-referred brightness of the hottest disk pixel (settings.blackHole.peakLevel): high enough that the inner
+// edge blows out to white-hot while the rest of the disk glows deep red and orange.
+const DISK_PEAK_LEVEL = 10;
+
+// Strength of the bloom (settings.bloom.strength): the soft glow that spreads from the bright ribbons into the dark sky.
+const BLOOM_STRENGTH = 0.16;
 
 /** Convert black-hole information into renderer input. */
 function toBlackHoleBody(bh: BlackHole): BlackHoleBody {
@@ -136,6 +140,7 @@ const gravity = new Gravity(
 const renderer = createRenderer({
   settings: {
     blackHole: { peakLevel: DISK_PEAK_LEVEL },
+    bloom: { strength: BLOOM_STRENGTH },
   },
 });
 
