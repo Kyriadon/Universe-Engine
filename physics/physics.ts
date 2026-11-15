@@ -11,6 +11,11 @@
  *   sub-steps (a fraction of the local free-fall time), so orbits stay stable at any simulation speed. A body that reaches
  *   a horizon is captured and stops. The plasma below orbits with the same law (keplerOmegaRg).
  *
+ * LIGHT (middle)
+ *   Reference TypeScript versions of the relativistic light physics the blackhole shader evaluates per pixel on the GPU:
+ *   gravitational redshift, Doppler shift, the g^4 intensity law, blackbody radiance, the photon sphere and the shadow
+ *   edge. Use them for anything on the CPU side that needs the same numbers.
+ *
  * PLASMA (second half)
  *
  * Writes ONE RGBA16F texture, mipmapped, LINEAR, wrap S = CLAMP_TO_EDGE, wrap T = REPEAT:
@@ -204,6 +209,61 @@ export class Gravity implements GravityModel {
 }
 
 // ---------------------------------------------------------------------------------------------
+// LIGHT
+// ---------------------------------------------------------------------------------------------
+
+/** Stefan-Boltzmann constant, W m^-2 K^-4. */
+export const STEFAN_BOLTZMANN = 5.670374419e-8;
+/** Wien displacement constant, m K. */
+export const WIEN_DISPLACEMENT_M_K = 2.897771955e-3;
+/** Radius of the Schwarzschild photon sphere, in R_g. */
+export const PHOTON_SPHERE_RG = 3;
+/** Critical impact parameter in R_g, 3*sqrt(3): rays with less than this are captured, which is the shadow edge. */
+export const CRITICAL_IMPACT_PARAMETER_RG = 3 * Math.sqrt(3);
+/** Orbital speeds never reach c: beta is clamped to this. */
+const MAX_BETA = 0.999999;
+
+/** Redshift factor sqrt(1 - 2/r) of light climbing out of a static emitter at rRg (0 at the horizon and inside). */
+export function gravitationalRedshiftFactor(rRg: number): number {
+  return rRg > 2 ? Math.sqrt(1 - 2 / rRg) : 0;
+}
+
+/** Speed (in c) of a circular orbit at rRg as a static observer measures it, sqrt(1 / (r - 2)); clamped below c. */
+export function circularOrbitBeta(rRg: number): number {
+  return rRg > 2 ? Math.min(Math.sqrt(1 / (rRg - 2)), MAX_BETA) : MAX_BETA;
+}
+
+/**
+ * Relativistic Doppler factor 1 / (gamma (1 - beta cos(theta))): beta is the emitter's speed in c, cosAngle the cosine of
+ * the angle between its velocity and the direction to the observer. Above 1 means blueshifted (moving towards us).
+ */
+export function dopplerFactor(beta: number, cosAngle: number): number {
+  const b = Math.min(Math.max(beta, 0), MAX_BETA);
+  const gamma = 1 / Math.sqrt(1 - b * b);
+  return 1 / (gamma * (1 - b * cosAngle));
+}
+
+/** Observed intensity relative to emitted for a total shift g (Liouville: intensity / frequency^3 is conserved): g^4 for bolometric light. */
+export function observedIntensityFactor(g: number): number {
+  return g * g * g * g;
+}
+
+/** Observed colour temperature of blackbody light emitted at emittedK and shifted by g. */
+export function observedTemperatureK(emittedK: number, g: number): number {
+  return emittedK * g;
+}
+
+/** Bolometric blackbody radiance, W m^-2 sr^-1: sigma T^4 / pi. */
+export function blackbodyBolometricRadiance(temperatureK: number): number {
+  return (STEFAN_BOLTZMANN * Math.pow(temperatureK, 4)) / Math.PI;
+}
+
+/** Wavelength of peak blackbody emission, metres. */
+export function wienPeakWavelengthM(temperatureK: number): number {
+  return WIEN_DISPLACEMENT_M_K / temperatureK;
+}
+
+// ---------------------------------------------------------------------------------------------
 // PLASMA
 // ---------------------------------------------------------------------------------------------
 
@@ -220,7 +280,7 @@ const REBUILD_STEP_RG = 3;
 /** Turbulence: feature size in azimuth (cycles per radian-ish, larger = finer), in ln(r), and the density contrast. */
 const STREAK_PHI = 2.5;
 const STREAK_R = 7;
-const DENSITY_CONTRAST = 0.6;
+const DENSITY_CONTRAST = 0.9;
 /** Temperature fluctuation amplitude (fraction of the local temperature). Brightness goes as T^4, so this must stay small. */
 const TEMPERATURE_NOISE = 0.08;
 
